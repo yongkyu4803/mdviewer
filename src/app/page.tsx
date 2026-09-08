@@ -30,8 +30,13 @@ import {
   Info,
   Clock,
   Sparkles,
-  FileDown
+  FileDown,
+  FileType,
+  FileType2,
+  ChevronDown,
+  Loader2
 } from 'lucide-react';
+import { exportMarkdownToPdf, exportMarkdownToDocx } from '@/lib/markdownExport';
 
 interface MarkdownDocument {
   id: string;
@@ -178,9 +183,13 @@ export default function Home() {
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [cheatsheetOpen, setCheatsheetOpen] = useState(false);
   const [activeLine, setActiveLine] = useState<number | null>(null);
+  const [exportMenu, setExportMenu] = useState<'sidebar' | 'header' | null>(null);
+  const [exportingFormat, setExportingFormat] = useState<'pdf' | 'docx' | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const sidebarExportRef = useRef<HTMLDivElement>(null);
+  const headerExportRef = useRef<HTMLDivElement>(null);
 
   // Initialize documents from LocalStorage or use defaults
   useEffect(() => {
@@ -213,6 +222,19 @@ export default function Home() {
       document.documentElement.setAttribute('data-theme', 'light');
     }
   }, []);
+
+  // Close the export format menu when clicking outside of it
+  useEffect(() => {
+    if (!exportMenu) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      const ref = exportMenu === 'sidebar' ? sidebarExportRef : headerExportRef;
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setExportMenu(null);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, [exportMenu]);
 
   // Sync theme changes with DOM
   const toggleTheme = () => {
@@ -322,6 +344,30 @@ export default function Home() {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+  };
+
+  const handleExport = async (format: 'md' | 'pdf' | 'docx') => {
+    setExportMenu(null);
+    if (!activeDoc) return;
+
+    if (format === 'md') {
+      exportDoc();
+      return;
+    }
+
+    setExportingFormat(format);
+    try {
+      if (format === 'pdf') {
+        exportMarkdownToPdf(activeDoc.title, activeDoc.content);
+      } else {
+        await exportMarkdownToDocx(activeDoc.title, activeDoc.content);
+      }
+    } catch (err) {
+      console.error('Export failed:', err);
+      alert('Something went wrong while exporting. Please try again.');
+    } finally {
+      setExportingFormat(null);
+    }
   };
 
   const importDoc = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -486,14 +532,43 @@ export default function Home() {
               className="hidden" 
             />
             
-            <button
-              onClick={exportDoc}
-              className="flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg border text-xs font-medium hover:bg-[var(--bg-button-hover)] transition-colors duration-150"
-              style={{ borderColor: 'var(--border-color)', color: 'var(--text-secondary)', backgroundColor: 'var(--bg-sidebar)' }}
-            >
-              <FileDown className="w-3.5 h-3.5" />
-              Export
-            </button>
+            <div className="relative" ref={sidebarExportRef}>
+              <button
+                onClick={() => setExportMenu(exportMenu === 'sidebar' ? null : 'sidebar')}
+                disabled={exportingFormat !== null}
+                className="w-full flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg border text-xs font-medium hover:bg-[var(--bg-button-hover)] transition-colors duration-150 disabled:opacity-60"
+                style={{ borderColor: 'var(--border-color)', color: 'var(--text-secondary)', backgroundColor: 'var(--bg-sidebar)' }}
+              >
+                {exportingFormat ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <FileDown className="w-3.5 h-3.5" />}
+                Export
+                <ChevronDown className="w-3 h-3 opacity-60" />
+              </button>
+              {exportMenu === 'sidebar' && (
+                <div className="glass animate-fade-in absolute left-0 right-0 top-full mt-1.5 z-20 rounded-lg overflow-hidden">
+                  <button
+                    onClick={() => handleExport('md')}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium hover:bg-[var(--bg-button-hover)] transition-colors duration-150"
+                    style={{ color: 'var(--text-secondary)' }}
+                  >
+                    <FileText className="w-3.5 h-3.5" /> Markdown (.md)
+                  </button>
+                  <button
+                    onClick={() => handleExport('pdf')}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium hover:bg-[var(--bg-button-hover)] transition-colors duration-150"
+                    style={{ color: 'var(--text-secondary)' }}
+                  >
+                    <FileType className="w-3.5 h-3.5" /> PDF (.pdf)
+                  </button>
+                  <button
+                    onClick={() => handleExport('docx')}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium hover:bg-[var(--bg-button-hover)] transition-colors duration-150"
+                    style={{ color: 'var(--text-secondary)' }}
+                  >
+                    <FileType2 className="w-3.5 h-3.5" /> Word (.docx)
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </div>
 
@@ -642,15 +717,44 @@ export default function Home() {
               <HelpCircle className="w-4 h-4" style={{ color: 'var(--text-primary)' }} />
             </button>
 
-            <button
-              onClick={exportDoc}
-              className="py-2 px-3 rounded-lg border hover:bg-[var(--bg-button-hover)] transition-colors duration-150 text-xs font-semibold flex items-center gap-1.5"
-              style={{ borderColor: 'var(--border-color)', color: 'var(--text-secondary)' }}
-              title="Download File"
-            >
-              <Download className="w-4 h-4" />
-              <span className="hidden md:inline">Export</span>
-            </button>
+            <div className="relative" ref={headerExportRef}>
+              <button
+                onClick={() => setExportMenu(exportMenu === 'header' ? null : 'header')}
+                disabled={exportingFormat !== null}
+                className="py-2 px-3 rounded-lg border hover:bg-[var(--bg-button-hover)] transition-colors duration-150 text-xs font-semibold flex items-center gap-1.5 disabled:opacity-60"
+                style={{ borderColor: 'var(--border-color)', color: 'var(--text-secondary)' }}
+                title="Download File"
+              >
+                {exportingFormat ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+                <span className="hidden md:inline">Export</span>
+                <ChevronDown className="w-3 h-3 opacity-60 hidden md:inline" />
+              </button>
+              {exportMenu === 'header' && (
+                <div className="glass animate-fade-in absolute right-0 top-full mt-1.5 z-20 rounded-lg overflow-hidden w-44">
+                  <button
+                    onClick={() => handleExport('md')}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium hover:bg-[var(--bg-button-hover)] transition-colors duration-150"
+                    style={{ color: 'var(--text-secondary)' }}
+                  >
+                    <FileText className="w-3.5 h-3.5" /> Markdown (.md)
+                  </button>
+                  <button
+                    onClick={() => handleExport('pdf')}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium hover:bg-[var(--bg-button-hover)] transition-colors duration-150"
+                    style={{ color: 'var(--text-secondary)' }}
+                  >
+                    <FileType className="w-3.5 h-3.5" /> PDF (.pdf)
+                  </button>
+                  <button
+                    onClick={() => handleExport('docx')}
+                    className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium hover:bg-[var(--bg-button-hover)] transition-colors duration-150"
+                    style={{ color: 'var(--text-secondary)' }}
+                  >
+                    <FileType2 className="w-3.5 h-3.5" /> Word (.docx)
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </header>
 
