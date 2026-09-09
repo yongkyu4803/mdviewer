@@ -1,6 +1,6 @@
 import { marked, type Token, type Tokens } from 'marked';
-import { jsPDF } from 'jspdf';
-import html2canvas from 'html2canvas';
+import { PDFDocument, rgb, type PDFFont, type PDFPage } from 'pdf-lib';
+import fontkit from '@pdf-lib/fontkit';
 import {
   AlignmentType,
   BorderStyle,
@@ -182,132 +182,183 @@ function downloadBlob(blob: Blob, filename: string) {
 // PDF export
 // ---------------------------------------------------------------------------
 
-// jsPDF's built-in fonts (helvetica/courier) only cover WinAnsi (Latin) glyphs — Korean,
-// or any other non-Latin text, renders as garbage with them. Rather than embedding a CJK
-// font, we render the same HTML the live preview uses into an off-screen, print-styled
-// container (plain hex colors — not the app's oklch/CSS-variable theme, which html2canvas
-// can't parse) and let the browser's own font stack draw the glyphs, via jsPDF's `.html()`
-// (html2canvas-backed) renderer.
-const PDF_FONT_STACK =
-  "'Malgun Gothic','Apple SD Gothic Neo','Noto Sans KR','Noto Sans CJK KR',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif";
-const PDF_MONO_STACK = "'D2Coding','Nanum Gothic Coding',Menlo,Consolas,'Courier New',monospace";
+const PDF_PAGE_WIDTH = 595.28;
+const PDF_PAGE_HEIGHT = 841.89;
+const PDF_MARGIN = 48;
+const PDF_CONTENT_WIDTH = PDF_PAGE_WIDTH - PDF_MARGIN * 2;
+const nanumGothicRegularUrl = '/fonts/NanumGothic.ttf';
+const nanumGothicBoldUrl = '/fonts/NanumGothicBold.ttf';
 
-function pdfPrintCss(): string {
-  return `
-    .md-export-root {
-      color: #111111;
-      background: #ffffff;
-      font-family: ${PDF_FONT_STACK};
-      font-size: 13px;
-      line-height: 1.7;
-      word-break: break-word;
-    }
-    .md-export-root h1, .md-export-root h2, .md-export-root h3,
-    .md-export-root h4, .md-export-root h5, .md-export-root h6 {
-      font-weight: 700; color: #111111; line-height: 1.35;
-      margin: 1.4em 0 0.6em;
-    }
-    .md-export-root h1 { font-size: 1.9em; border-bottom: 1px solid #e5e7eb; padding-bottom: 0.3em; }
-    .md-export-root h2 { font-size: 1.5em; border-bottom: 1px solid #e5e7eb; padding-bottom: 0.25em; }
-    .md-export-root h3 { font-size: 1.2em; }
-    .md-export-root h4 { font-size: 1.05em; }
-    .md-export-root p { margin: 0 0 0.9em; color: #374151; }
-    .md-export-root strong { font-weight: 700; color: #111111; }
-    .md-export-root em { color: #374151; }
-    .md-export-root a { color: #111111; text-decoration: underline; }
-    .md-export-root code {
-      font-family: ${PDF_MONO_STACK}; font-size: 0.88em;
-      background: #ebebeb; color: #111111; padding: 0.12em 0.35em; border-radius: 4px;
-    }
-    .md-export-root pre {
-      background: #f5f5f5; border: 1px solid #e5e7eb; border-radius: 6px;
-      padding: 0.9em 1em; margin: 0 0 1em; overflow-wrap: break-word; white-space: pre-wrap;
-    }
-    .md-export-root pre code { background: transparent; padding: 0; font-size: 0.85em; }
-    .md-export-root blockquote {
-      border-left: 3px solid #d1d5db; padding: 0.5em 1em; margin: 1em 0;
-      color: #6b7280; font-style: italic;
-    }
-    .md-export-root ul, .md-export-root ol { margin: 0 0 0.9em; padding-left: 1.4em; color: #374151; }
-    .md-export-root li { margin-bottom: 0.25em; }
-    .md-export-root table { width: 100%; border-collapse: collapse; margin: 0 0 1em; font-size: 0.92em; }
-    .md-export-root th, .md-export-root td { border: 1px solid #e5e7eb; padding: 0.5em 0.7em; text-align: left; }
-    .md-export-root th { background: #f3f4f6; font-weight: 700; }
-    .md-export-root tr:nth-child(even) td { background: #fafafa; }
-    .md-export-root img { max-width: 100%; border-radius: 6px; margin: 0.6em 0; }
-    .md-export-root hr { border: none; height: 1px; background: #e5e7eb; margin: 1.4em 0; }
-  `;
+function runsText(runs: Run[]): string {
+  return runs.map((run) => run.text).join('');
 }
 
-const PDF_CONTAINER_WIDTH_PX = 760;
-// A4's printable width here is about 7.3in. Rendering 760 CSS px at 3x gives
-// roughly 315 DPI in the output instead of the former ~200 DPI cap.
-const PDF_RENDER_SCALE = 3;
+function blockText(block: Block): string {
+  switch (block.kind) {
+    case 'heading':
+    case 'paragraph':
+      return runsText(block.runs);
+    case 'code':
+      return block.text;
+    case 'blockquote':
+      return block.blocks.map(blockText).join('\n');
+    case 'list':
+      return block.items.map((item) => item.content.map(blockText).join(' ')).join('\n');
+    case 'table':
+      return [block.header, ...block.rows].map((row) => row.map(runsText).join(' | ')).join('\n');
+    case 'hr':
+      return '';
+  }
+}
+
+function wrapPdfText(text: string, font: PDFFont, size: number, maxWidth: number): string[] {
+  const wrapped: string[] = [];
+  for (const sourceLine of text.replace(/\r/g, '').split('\n')) {
+    if (!sourceLine) {
+      wrapped.push('');
+      continue;
+    }
+    let line = '';
+    const append = (part: string) => {
+      if (font.widthOfTextAtSize(line + part, size) <= maxWidth) {
+        line += part;
+        return;
+      }
+      if (line.trim()) wrapped.push(line.trimEnd());
+      line = '';
+      for (const character of Array.from(part.trimStart())) {
+        if (font.widthOfTextAtSize(line + character, size) > maxWidth && line) {
+          wrapped.push(line);
+          line = '';
+        }
+        line += character;
+      }
+    };
+    for (const part of sourceLine.split(/(\s+)/)) {
+      if (part) append(part);
+    }
+    if (line.trim()) wrapped.push(line.trimEnd());
+  }
+  return wrapped;
+}
+
+class PdfLayout {
+  private page: PDFPage;
+  private y = PDF_PAGE_HEIGHT - PDF_MARGIN;
+
+  constructor(private readonly document: PDFDocument, private readonly regular: PDFFont, private readonly bold: PDFFont) {
+    this.page = document.addPage([PDF_PAGE_WIDTH, PDF_PAGE_HEIGHT]);
+  }
+
+  private ensureSpace(height: number) {
+    if (this.y - height < PDF_MARGIN) {
+      this.page = this.document.addPage([PDF_PAGE_WIDTH, PDF_PAGE_HEIGHT]);
+      this.y = PDF_PAGE_HEIGHT - PDF_MARGIN;
+    }
+  }
+
+  private line(text: string, size: number, font: PDFFont, indent = 0, color = rgb(0.15, 0.18, 0.23), background?: ReturnType<typeof rgb>) {
+    const lineHeight = size * 1.55;
+    this.ensureSpace(lineHeight);
+    this.y -= lineHeight;
+    if (background) {
+      this.page.drawRectangle({ x: PDF_MARGIN + indent - 4, y: this.y - 3, width: PDF_CONTENT_WIDTH - indent + 8, height: lineHeight, color: background });
+    }
+    if (text) this.page.drawText(text, { x: PDF_MARGIN + indent, y: this.y, size, font, color });
+  }
+
+  paragraph(text: string, options: { size?: number; bold?: boolean; indent?: number; color?: ReturnType<typeof rgb>; after?: number } = {}) {
+    const size = options.size ?? 10.5;
+    const indent = options.indent ?? 0;
+    const font = options.bold ? this.bold : this.regular;
+    for (const line of wrapPdfText(text, font, size, PDF_CONTENT_WIDTH - indent)) {
+      this.line(line, size, font, indent, options.color);
+    }
+    this.y -= options.after ?? 5;
+  }
+
+  heading(text: string, depth: number) {
+    const size = [20, 16, 13, 11.5, 10.8, 10.5][depth - 1] ?? 10.5;
+    this.y -= 6;
+    this.paragraph(text, { size, bold: true, color: rgb(0.05, 0.07, 0.1), after: depth <= 2 ? 6 : 3 });
+    if (depth <= 2) {
+      this.ensureSpace(8);
+      this.page.drawLine({ start: { x: PDF_MARGIN, y: this.y }, end: { x: PDF_PAGE_WIDTH - PDF_MARGIN, y: this.y }, thickness: 0.6, color: rgb(0.84, 0.86, 0.89) });
+      this.y -= 8;
+    }
+  }
+
+  rule() {
+    this.ensureSpace(18);
+    this.y -= 9;
+    this.page.drawLine({ start: { x: PDF_MARGIN, y: this.y }, end: { x: PDF_PAGE_WIDTH - PDF_MARGIN, y: this.y }, thickness: 0.6, color: rgb(0.78, 0.8, 0.83) });
+    this.y -= 9;
+  }
+
+  code(text: string) {
+    for (const line of wrapPdfText(text, this.regular, 9, PDF_CONTENT_WIDTH - 16)) {
+      this.line(line, 9, this.regular, 12, rgb(0.12, 0.15, 0.2), rgb(0.94, 0.95, 0.96));
+    }
+    this.y -= 6;
+  }
+}
+
+async function loadPdfFont(url: string): Promise<ArrayBuffer> {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error('Could not load the embedded PDF font.');
+  return response.arrayBuffer();
+}
 
 export async function exportMarkdownToPdf(title: string, markdown: string): Promise<void> {
-  const html = marked.parse(markdown) as string;
+  const pdf = await PDFDocument.create();
+  pdf.registerFontkit(fontkit);
+  const [regularBytes, boldBytes] = await Promise.all([
+    loadPdfFont(nanumGothicRegularUrl),
+    loadPdfFont(nanumGothicBoldUrl),
+  ]);
+  const regular = await pdf.embedFont(regularBytes, { subset: true });
+  const bold = await pdf.embedFont(boldBytes, { subset: true });
+  const layout = new PdfLayout(pdf, regular, bold);
 
-  const container = document.createElement('div');
-  container.className = 'md-export-root';
-  container.innerHTML = `<style>${pdfPrintCss()}</style>${html}`;
-  Object.assign(container.style, {
-    position: 'fixed',
-    top: '0',
-    left: '-99999px',
-    width: `${PDF_CONTAINER_WIDTH_PX}px`,
-    background: '#ffffff',
-    boxSizing: 'border-box',
-  } satisfies Partial<CSSStyleDeclaration>);
-  document.body.appendChild(container);
-
-  try {
-    // Rasterize the whole document once, then slice the tall canvas into page-sized
-    // strips ourselves. jsPDF's own `.html()` pagination (context2d + autoPaging) proved
-    // unreliable — it produced blank/corrupt pages on this content — so we drive
-    // html2canvas + doc.addImage directly instead.
-    const canvas = await html2canvas(container, {
-      backgroundColor: '#ffffff',
-      scale: PDF_RENDER_SCALE,
-      useCORS: true,
-      windowWidth: PDF_CONTAINER_WIDTH_PX,
-    });
-
-    const doc = new jsPDF({ unit: 'pt', format: 'a4', compress: true });
-    const margin = 36;
-    const pageWidth = doc.internal.pageSize.getWidth();
-    const pageHeight = doc.internal.pageSize.getHeight();
-    const contentWidth = pageWidth - margin * 2;
-    const contentHeight = pageHeight - margin * 2;
-
-    const pxToPt = contentWidth / canvas.width;
-    const pageHeightPx = Math.floor(contentHeight / pxToPt);
-
-    let renderedPx = 0;
-    let isFirstPage = true;
-    while (renderedPx < canvas.height) {
-      const sliceHeightPx = Math.min(pageHeightPx, canvas.height - renderedPx);
-      const sliceCanvas = document.createElement('canvas');
-      sliceCanvas.width = canvas.width;
-      sliceCanvas.height = sliceHeightPx;
-      const ctx = sliceCanvas.getContext('2d');
-      if (!ctx) break;
-      ctx.fillStyle = '#ffffff';
-      ctx.fillRect(0, 0, sliceCanvas.width, sliceCanvas.height);
-      ctx.drawImage(canvas, 0, renderedPx, canvas.width, sliceHeightPx, 0, 0, canvas.width, sliceHeightPx);
-
-      if (!isFirstPage) doc.addPage();
-      isFirstPage = false;
-      // PNG keeps glyph edges lossless. JPEG compression was visibly blurring
-      // Korean text and fine code fonts, especially when zooming into a PDF.
-      doc.addImage(sliceCanvas, 'PNG', margin, margin, contentWidth, sliceHeightPx * pxToPt, undefined, 'FAST');
-
-      renderedPx += sliceHeightPx;
+  for (const block of tokensToBlocks(marked.lexer(markdown))) {
+    switch (block.kind) {
+      case 'heading':
+        layout.heading(runsText(block.runs), block.depth);
+        break;
+      case 'paragraph':
+        layout.paragraph(runsText(block.runs));
+        break;
+      case 'code':
+        layout.code(block.text);
+        break;
+      case 'blockquote':
+        layout.paragraph(block.blocks.map(blockText).join('\n'), { indent: 14, color: rgb(0.32, 0.36, 0.42) });
+        break;
+      case 'list':
+        block.items.forEach((item, index) => {
+          const marker = block.ordered ? `${Number(block.start || 1) + index}. ` : item.task ? (item.checked ? '[x] ' : '[ ] ') : '- ';
+          layout.paragraph(`${marker}${item.content.map(blockText).join(' ')}`, { indent: 12, after: 2 });
+          item.sub.forEach((sub) => layout.paragraph(blockText(sub), { indent: 28, after: 2 }));
+        });
+        break;
+      case 'table':
+        [block.header, ...block.rows].forEach((row, index) => {
+          layout.paragraph(row.map(runsText).join(' | '), { size: 9.5, bold: index === 0, after: 2 });
+        });
+        break;
+      case 'hr':
+        layout.rule();
+        break;
     }
-
-    doc.save(`${baseFileName(title)}.pdf`);
-  } finally {
-    document.body.removeChild(container);
   }
+
+  const pages = pdf.getPages();
+  pages.forEach((page, index) => {
+    page.drawText(`${index + 1} / ${pages.length}`, { x: PDF_PAGE_WIDTH - PDF_MARGIN - 28, y: 24, size: 8, font: regular, color: rgb(0.45, 0.48, 0.52) });
+  });
+  const pdfBytes = await pdf.save();
+  const pdfBuffer = pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength) as ArrayBuffer;
+  downloadBlob(new Blob([pdfBuffer], { type: 'application/pdf' }), `${baseFileName(title)}.pdf`);
 }
 
 // ---------------------------------------------------------------------------
