@@ -425,7 +425,7 @@ export default function Home() {
     setExportingFormat(format);
     try {
       if (format === 'pdf') {
-        exportMarkdownToPdf(activeDoc.title, activeDoc.content);
+        await exportMarkdownToPdf(activeDoc.title, activeDoc.content);
       } else {
         await exportMarkdownToDocx(activeDoc.title, activeDoc.content);
       }

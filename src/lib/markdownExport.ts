@@ -186,6 +186,7 @@ const PDF_PAGE_WIDTH = 595.28;
 const PDF_PAGE_HEIGHT = 841.89;
 const PDF_MARGIN = 48;
 const PDF_CONTENT_WIDTH = PDF_PAGE_WIDTH - PDF_MARGIN * 2;
+const PDF_CONTENT_HEIGHT = PDF_PAGE_HEIGHT - PDF_MARGIN * 2;
 const nanumGothicRegularUrl = '/fonts/NanumGothic.ttf';
 const nanumGothicBoldUrl = '/fonts/NanumGothicBold.ttf';
 
@@ -213,7 +214,7 @@ function blockText(block: Block): string {
 
 function wrapPdfText(text: string, font: PDFFont, size: number, maxWidth: number): string[] {
   const wrapped: string[] = [];
-  for (const sourceLine of text.replace(/\r/g, '').split('\n')) {
+  for (const sourceLine of text.replace(/\r/g, '').replace(/\t/g, '    ').split('\n')) {
     if (!sourceLine) {
       wrapped.push('');
       continue;
@@ -257,6 +258,33 @@ class PdfLayout {
     }
   }
 
+  private keepTogether(height: number) {
+    if (height <= PDF_CONTENT_HEIGHT) this.ensureSpace(height);
+  }
+
+  leadingHeight(block: Block | undefined): number {
+    if (!block) return 0;
+    if (block.kind === 'code') {
+      const height = wrapPdfText(block.text, this.regular, 9, PDF_CONTENT_WIDTH - 16).length * 9 * 1.55;
+      return height <= PDF_CONTENT_HEIGHT ? height : 2 * 9 * 1.55;
+    }
+    if (block.kind === 'list') {
+      const first = block.items[0];
+      if (!first) return 0;
+      const text = `- ${first.content.map(blockText).join(' ')}`;
+      const height = wrapPdfText(text, this.regular, 10.5, PDF_CONTENT_WIDTH - 12).length * 10.5 * 1.55;
+      return height <= PDF_CONTENT_HEIGHT ? height : 2 * 10.5 * 1.55;
+    }
+    if (block.kind === 'table') {
+      const width = Math.max(1, PDF_CONTENT_WIDTH / block.header.length - 12);
+      const height = (row: Run[][], font: PDFFont) => Math.max(1, ...row.map((cell) => wrapPdfText(runsText(cell), font, 9.5, width).length)) * 9.5 * 1.55 + 12;
+      const header = height(block.header, this.bold);
+      const first = block.rows[0] ? height(block.rows[0], this.regular) : 0;
+      return header + first <= PDF_CONTENT_HEIGHT ? header + first : Math.min(header, PDF_CONTENT_HEIGHT / 2) + 9.5 * 1.55 + 12;
+    }
+    return 2 * 10.5 * 1.55;
+  }
+
   private line(text: string, size: number, font: PDFFont, indent = 0, color = rgb(0.15, 0.18, 0.23), background?: ReturnType<typeof rgb>) {
     const lineHeight = size * 1.55;
     this.ensureSpace(lineHeight);
@@ -267,20 +295,33 @@ class PdfLayout {
     if (text) this.page.drawText(text, { x: PDF_MARGIN + indent, y: this.y, size, font, color });
   }
 
-  paragraph(text: string, options: { size?: number; bold?: boolean; indent?: number; color?: ReturnType<typeof rgb>; after?: number } = {}) {
+  paragraph(text: string, options: { size?: number; bold?: boolean; indent?: number; color?: ReturnType<typeof rgb>; after?: number; keepTogether?: boolean } = {}) {
     const size = options.size ?? 10.5;
     const indent = options.indent ?? 0;
     const font = options.bold ? this.bold : this.regular;
-    for (const line of wrapPdfText(text, font, size, PDF_CONTENT_WIDTH - indent)) {
-      this.line(line, size, font, indent, options.color);
+    const lines = wrapPdfText(text, font, size, PDF_CONTENT_WIDTH - indent);
+    const lineHeight = size * 1.55;
+    if (options.keepTogether) this.keepTogether(lines.length * lineHeight);
+    // Keep at least two lines at either side of a paragraph page break.
+    this.ensureSpace(Math.min(2, lines.length) * lineHeight);
+    for (let index = 0; index < lines.length; index++) {
+      if (lines.length - index === 2) this.ensureSpace(2 * lineHeight);
+      this.line(lines[index], size, font, indent, options.color);
     }
     this.y -= options.after ?? 5;
   }
 
-  heading(text: string, depth: number) {
+  heading(text: string, depth: number, followingHeight = 0) {
     const size = [20, 16, 13, 11.5, 10.8, 10.5][depth - 1] ?? 10.5;
+    const lines = wrapPdfText(text, this.bold, size, PDF_CONTENT_WIDTH);
+    const decoration = depth <= 2 ? 14 : 3;
+    this.keepTogether(6 + lines.length * size * 1.55 + decoration + followingHeight);
     this.y -= 6;
-    this.paragraph(text, { size, bold: true, color: rgb(0.05, 0.07, 0.1), after: depth <= 2 ? 6 : 3 });
+    lines.forEach((line, index) => {
+      if (index === lines.length - 1) this.keepTogether(size * 1.55 + decoration + followingHeight);
+      this.line(line, size, this.bold, 0, rgb(0.05, 0.07, 0.1));
+    });
+    this.y -= depth <= 2 ? 6 : 3;
     if (depth <= 2) {
       this.ensureSpace(8);
       this.page.drawLine({ start: { x: PDF_MARGIN, y: this.y }, end: { x: PDF_PAGE_WIDTH - PDF_MARGIN, y: this.y }, thickness: 0.6, color: rgb(0.84, 0.86, 0.89) });
@@ -296,9 +337,75 @@ class PdfLayout {
   }
 
   code(text: string) {
-    for (const line of wrapPdfText(text, this.regular, 9, PDF_CONTENT_WIDTH - 16)) {
+    const lines = wrapPdfText(text, this.regular, 9, PDF_CONTENT_WIDTH - 16);
+    this.keepTogether(lines.length * 9 * 1.55);
+    for (const line of lines) {
       this.line(line, 9, this.regular, 12, rgb(0.12, 0.15, 0.2), rgb(0.94, 0.95, 0.96));
     }
+    this.y -= 6;
+  }
+
+  table(block: Extract<Block, { kind: 'table' }>) {
+    const size = 9.5;
+    const lineHeight = size * 1.55;
+    const padding = 6;
+    const width = PDF_CONTENT_WIDTH / block.header.length;
+    const wrapRow = (row: Run[][], font: PDFFont) => row.map((cell) =>
+      wrapPdfText(runsText(cell), font, size, Math.max(1, width - padding * 2)));
+    const header = wrapRow(block.header, this.bold);
+    const count = (cells: string[][]) => Math.max(1, ...cells.map((cell) => cell.length));
+    const headerHeight = count(header) * lineHeight + padding * 2;
+    const draw = (cells: string[][], offset: number, length: number, isHeader: boolean) => {
+      const height = length * lineHeight + padding * 2;
+      const font = isHeader ? this.bold : this.regular;
+      cells.forEach((cell, column) => {
+        const x = PDF_MARGIN + column * width;
+        this.page.drawRectangle({ x, y: this.y - height, width, height,
+          borderWidth: 0.5, borderColor: rgb(0.8, 0.82, 0.85),
+          color: isHeader ? rgb(0.94, 0.95, 0.96) : rgb(1, 1, 1) });
+        cell.slice(offset, offset + length).forEach((text, index) => {
+          if (!text) return;
+          const textWidth = font.widthOfTextAtSize(text, size);
+          const align = block.align[column];
+          const shift = align === 'right' ? width - padding - textWidth : align === 'center' ? (width - textWidth) / 2 : padding;
+          this.page.drawText(text, { x: x + shift, y: this.y - padding - size - index * lineHeight, size, font });
+        });
+      });
+      this.y -= height;
+    };
+    // Very tall headers are allowed to span pages; repeating them would leave
+    // no space for data. Normal headers repeat on each continuation page.
+    const repeatHeader = headerHeight <= PDF_CONTENT_HEIGHT / 2;
+    const nextPage = () => {
+      this.page = this.document.addPage([PDF_PAGE_WIDTH, PDF_PAGE_HEIGHT]);
+      this.y = PDF_PAGE_HEIGHT - PDF_MARGIN;
+    };
+    const rows = [header, ...block.rows.map((row) => wrapRow(row, this.regular))];
+    rows.forEach((cells, rowIndex) => {
+      const total = count(cells);
+      const fullHeight = total * lineHeight + padding * 2;
+      const firstRowHeight = rows[1] ? count(rows[1]) * lineHeight + padding * 2 : 0;
+      const reserve = rowIndex === 0 && rows.length > 1
+        ? (headerHeight + firstRowHeight <= PDF_CONTENT_HEIGHT ? firstRowHeight : lineHeight + padding * 2)
+        : 0;
+      const capacity = PDF_CONTENT_HEIGHT - (rowIndex > 0 && repeatHeader ? headerHeight : 0);
+      if (fullHeight + reserve <= capacity && this.y - fullHeight - reserve < PDF_MARGIN) {
+        nextPage();
+        if (rowIndex > 0 && repeatHeader) draw(header, 0, count(header), true);
+      }
+      let offset = 0;
+      while (offset < total) {
+        let available = Math.floor((this.y - PDF_MARGIN - padding * 2) / lineHeight);
+        if (available < 1) {
+          nextPage();
+          if (rowIndex > 0 && repeatHeader) draw(header, 0, count(header), true);
+          available = Math.floor((this.y - PDF_MARGIN - padding * 2) / lineHeight);
+        }
+        const length = Math.min(total - offset, available);
+        draw(cells, offset, length, rowIndex === 0);
+        offset += length;
+      }
+    });
     this.y -= 6;
   }
 }
@@ -309,21 +416,24 @@ async function loadPdfFont(url: string): Promise<ArrayBuffer> {
   return response.arrayBuffer();
 }
 
-export async function exportMarkdownToPdf(title: string, markdown: string): Promise<void> {
+export async function createMarkdownPdf(markdown: string): Promise<Uint8Array> {
   const pdf = await PDFDocument.create();
   pdf.registerFontkit(fontkit);
   const [regularBytes, boldBytes] = await Promise.all([
     loadPdfFont(nanumGothicRegularUrl),
     loadPdfFont(nanumGothicBoldUrl),
   ]);
-  const regular = await pdf.embedFont(regularBytes, { subset: true });
-  const bold = await pdf.embedFont(boldBytes, { subset: true });
+  // Nanum Gothic contains composite glyphs. Subsetting these fonts can leave
+  // extractable text with missing visible glyphs, so embed the complete fonts.
+  const regular = await pdf.embedFont(regularBytes);
+  const bold = await pdf.embedFont(boldBytes);
   const layout = new PdfLayout(pdf, regular, bold);
 
-  for (const block of tokensToBlocks(marked.lexer(markdown))) {
+  const blocks = tokensToBlocks(marked.lexer(markdown));
+  for (const [index, block] of blocks.entries()) {
     switch (block.kind) {
       case 'heading':
-        layout.heading(runsText(block.runs), block.depth);
+        layout.heading(runsText(block.runs), block.depth, layout.leadingHeight(blocks[index + 1]));
         break;
       case 'paragraph':
         layout.paragraph(runsText(block.runs));
@@ -337,14 +447,12 @@ export async function exportMarkdownToPdf(title: string, markdown: string): Prom
       case 'list':
         block.items.forEach((item, index) => {
           const marker = block.ordered ? `${Number(block.start || 1) + index}. ` : item.task ? (item.checked ? '[x] ' : '[ ] ') : '- ';
-          layout.paragraph(`${marker}${item.content.map(blockText).join(' ')}`, { indent: 12, after: 2 });
+          layout.paragraph(`${marker}${item.content.map(blockText).join(' ')}`, { indent: 12, after: 2, keepTogether: true });
           item.sub.forEach((sub) => layout.paragraph(blockText(sub), { indent: 28, after: 2 }));
         });
         break;
       case 'table':
-        [block.header, ...block.rows].forEach((row, index) => {
-          layout.paragraph(row.map(runsText).join(' | '), { size: 9.5, bold: index === 0, after: 2 });
-        });
+        layout.table(block);
         break;
       case 'hr':
         layout.rule();
@@ -356,7 +464,11 @@ export async function exportMarkdownToPdf(title: string, markdown: string): Prom
   pages.forEach((page, index) => {
     page.drawText(`${index + 1} / ${pages.length}`, { x: PDF_PAGE_WIDTH - PDF_MARGIN - 28, y: 24, size: 8, font: regular, color: rgb(0.45, 0.48, 0.52) });
   });
-  const pdfBytes = await pdf.save();
+  return pdf.save();
+}
+
+export async function exportMarkdownToPdf(title: string, markdown: string): Promise<void> {
+  const pdfBytes = await createMarkdownPdf(markdown);
   const pdfBuffer = pdfBytes.buffer.slice(pdfBytes.byteOffset, pdfBytes.byteOffset + pdfBytes.byteLength) as ArrayBuffer;
   downloadBlob(new Blob([pdfBuffer], { type: 'application/pdf' }), `${baseFileName(title)}.pdf`);
 }
