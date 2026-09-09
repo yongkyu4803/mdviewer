@@ -1,7 +1,8 @@
 'use client';
 
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { marked } from 'marked';
+import DOMPurify from 'dompurify';
 import { 
   FileText, 
   Plus, 
@@ -37,12 +38,20 @@ import {
   Loader2
 } from 'lucide-react';
 import { exportMarkdownToPdf, exportMarkdownToDocx } from '@/lib/markdownExport';
+import {
+  getStartupMarkdownPaths,
+  isDesktopApp,
+  onMarkdownOpened,
+  readMarkdownPath,
+  writeMarkdownPath,
+} from '@/lib/desktop';
 
 interface MarkdownDocument {
   id: string;
   title: string;
   content: string;
   updatedAt: string;
+  desktopFilePath?: string;
 }
 
 const DEFAULT_DOCUMENTS: MarkdownDocument[] = [
@@ -190,6 +199,31 @@ export default function Home() {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const sidebarExportRef = useRef<HTMLDivElement>(null);
   const headerExportRef = useRef<HTMLDivElement>(null);
+  const saveTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  const openDesktopPaths = useCallback(async (paths: string[]) => {
+    for (const path of paths) {
+      try {
+        const content = await readMarkdownPath(path);
+        const title = path.split('/').pop() || 'Untitled.md';
+        const document: MarkdownDocument = {
+          id: `file:${path}`,
+          title,
+          content,
+          updatedAt: new Date().toLocaleDateString(),
+          desktopFilePath: path,
+        };
+        setDocuments((current) => [
+          document,
+          ...current.filter((item) => item.id !== document.id),
+        ]);
+        setActiveDocId(document.id);
+        setViewMode('viewer');
+      } catch (error) {
+        console.error(`Could not open ${path}:`, error);
+      }
+    }
+  }, []);
 
   // Initialize documents from LocalStorage or use defaults
   useEffect(() => {
@@ -223,6 +257,21 @@ export default function Home() {
     }
   }, []);
 
+  // macOS passes files opened from Finder to Tauri. This also receives files
+  // while the application is already running.
+  useEffect(() => {
+    if (!isDesktopApp()) return;
+
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      unlisten = await onMarkdownOpened(openDesktopPaths);
+      const startupPaths = await getStartupMarkdownPaths();
+      await openDesktopPaths(startupPaths);
+    })();
+
+    return () => unlisten?.();
+  }, [openDesktopPaths]);
+
   // Close the export format menu when clicking outside of it
   useEffect(() => {
     if (!exportMenu) return;
@@ -254,7 +303,7 @@ export default function Home() {
     if (!activeDoc) return '';
     try {
       // marked parses synchronous and yields raw HTML string
-      return marked.parse(activeDoc.content) as string;
+      return DOMPurify.sanitize(marked.parse(activeDoc.content) as string);
     } catch (e) {
       return '<p style="color:red;">Error parsing Markdown content.</p>';
     }
@@ -285,6 +334,15 @@ export default function Home() {
     });
     setDocuments(updated);
     localStorage.setItem('markmd_documents', JSON.stringify(updated));
+    if (activeDoc.desktopFilePath) {
+      const existingTimer = saveTimersRef.current.get(activeDoc.desktopFilePath);
+      if (existingTimer) clearTimeout(existingTimer);
+      saveTimersRef.current.set(activeDoc.desktopFilePath, setTimeout(() => {
+        void writeMarkdownPath(activeDoc.desktopFilePath!, newContent).catch((error) => {
+          console.error('Could not save Markdown file:', error);
+        });
+      }, 400));
+    }
   };
 
   const updateActiveDocTitle = (newTitle: string) => {
@@ -334,8 +392,17 @@ export default function Home() {
     }
   };
 
-  const exportDoc = () => {
+  const exportDoc = async () => {
     if (!activeDoc) return;
+    if (activeDoc.desktopFilePath && isDesktopApp()) {
+      try {
+        await writeMarkdownPath(activeDoc.desktopFilePath, activeDoc.content);
+      } catch (error) {
+        console.error('Could not save Markdown file:', error);
+        alert('Could not save the Markdown file.');
+      }
+      return;
+    }
     const blob = new Blob([activeDoc.content], { type: 'text/markdown;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -351,7 +418,7 @@ export default function Home() {
     if (!activeDoc) return;
 
     if (format === 'md') {
-      exportDoc();
+      await exportDoc();
       return;
     }
 
