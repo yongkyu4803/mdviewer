@@ -37,10 +37,7 @@
         "role": "Editor",
         "mimeType": "text/markdown",
         "rank": "Owner",
-        "exportedType": {
-          "identifier": "kr.gqai.markmd.document",
-          "conformsTo": ["public.plain-text"]
-        }
+        "contentTypes": ["net.daringfireball.markdown", "public.plain-text"]
       }
     ],
     "icon": [
