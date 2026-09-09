@@ -240,6 +240,9 @@ function pdfPrintCss(): string {
 }
 
 const PDF_CONTAINER_WIDTH_PX = 760;
+// A4's printable width here is about 7.3in. Rendering 760 CSS px at 3x gives
+// roughly 315 DPI in the output instead of the former ~200 DPI cap.
+const PDF_RENDER_SCALE = 3;
 
 export async function exportMarkdownToPdf(title: string, markdown: string): Promise<void> {
   const html = marked.parse(markdown) as string;
@@ -264,12 +267,12 @@ export async function exportMarkdownToPdf(title: string, markdown: string): Prom
     // html2canvas + doc.addImage directly instead.
     const canvas = await html2canvas(container, {
       backgroundColor: '#ffffff',
-      scale: Math.min(2, window.devicePixelRatio || 1.5),
+      scale: PDF_RENDER_SCALE,
       useCORS: true,
       windowWidth: PDF_CONTAINER_WIDTH_PX,
     });
 
-    const doc = new jsPDF({ unit: 'pt', format: 'a4' });
+    const doc = new jsPDF({ unit: 'pt', format: 'a4', compress: true });
     const margin = 36;
     const pageWidth = doc.internal.pageSize.getWidth();
     const pageHeight = doc.internal.pageSize.getHeight();
@@ -294,7 +297,9 @@ export async function exportMarkdownToPdf(title: string, markdown: string): Prom
 
       if (!isFirstPage) doc.addPage();
       isFirstPage = false;
-      doc.addImage(sliceCanvas.toDataURL('image/jpeg', 0.92), 'JPEG', margin, margin, contentWidth, sliceHeightPx * pxToPt);
+      // PNG keeps glyph edges lossless. JPEG compression was visibly blurring
+      // Korean text and fine code fonts, especially when zooming into a PDF.
+      doc.addImage(sliceCanvas, 'PNG', margin, margin, contentWidth, sliceHeightPx * pxToPt, undefined, 'FAST');
 
       renderedPx += sliceHeightPx;
     }
