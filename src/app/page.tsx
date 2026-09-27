@@ -194,6 +194,9 @@ export default function Home() {
   const [activeLine, setActiveLine] = useState<number | null>(null);
   const [exportMenu, setExportMenu] = useState<'sidebar' | 'header' | null>(null);
   const [exportingFormat, setExportingFormat] = useState<'pdf' | 'docx' | null>(null);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -376,20 +379,34 @@ export default function Home() {
     localStorage.setItem('markmd_documents', JSON.stringify(updated));
   };
 
-  const deleteDoc = (id: string, e: React.MouseEvent) => {
+  // window.confirm()/alert() render nothing in the desktop app's WKWebView (it has no
+  // WKUIDelegate wired up for JS dialogs), so they silently no-op there instead of
+  // blocking for input. Use an in-app modal/toast instead — works in the browser too.
+  const showToast = (message: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast(message);
+    toastTimerRef.current = setTimeout(() => setToast(null), 3000);
+  };
+
+  const requestDeleteDoc = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (documents.length <= 1) {
-      alert("At least one document must remain in your library.");
+      showToast("At least one document must remain in your library.");
       return;
     }
-    if (confirm("Are you sure you want to delete this document?")) {
-      const updated = documents.filter(doc => doc.id !== id);
-      setDocuments(updated);
-      if (activeDocId === id) {
-        setActiveDocId(updated[0].id);
-      }
-      localStorage.setItem('markmd_documents', JSON.stringify(updated));
+    setConfirmDeleteId(id);
+  };
+
+  const confirmDeleteDoc = () => {
+    if (!confirmDeleteId) return;
+    const id = confirmDeleteId;
+    const updated = documents.filter(doc => doc.id !== id);
+    setDocuments(updated);
+    if (activeDocId === id) {
+      setActiveDocId(updated[0].id);
     }
+    localStorage.setItem('markmd_documents', JSON.stringify(updated));
+    setConfirmDeleteId(null);
   };
 
   const exportDoc = async () => {
@@ -399,7 +416,7 @@ export default function Home() {
         await writeMarkdownPath(activeDoc.desktopFilePath, activeDoc.content);
       } catch (error) {
         console.error('Could not save Markdown file:', error);
-        alert('Could not save the Markdown file.');
+        showToast('Could not save the Markdown file.');
       }
       return;
     }
@@ -431,7 +448,7 @@ export default function Home() {
       }
     } catch (err) {
       console.error('Export failed:', err);
-      alert('Something went wrong while exporting. Please try again.');
+      showToast('Something went wrong while exporting. Please try again.');
     } finally {
       setExportingFormat(null);
     }
@@ -677,7 +694,7 @@ export default function Home() {
                 </div>
 
                 <button 
-                  onClick={(e) => deleteDoc(doc.id, e)}
+                  onClick={(e) => requestDeleteDoc(doc.id, e)}
                   className={`p-1.5 rounded-md hover:bg-[var(--bg-button-hover)] transition-all ${
                     isActive ? 'opacity-70 hover:opacity-100' : 'opacity-0 group-hover:opacity-60 hover:!opacity-100'
                   }`}
@@ -980,6 +997,53 @@ export default function Home() {
 
       </div>
       </div>
+
+      {confirmDeleteId && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center animate-fade-in"
+          style={{ backgroundColor: 'rgba(0, 0, 0, 0.5)' }}
+          onClick={() => setConfirmDeleteId(null)}
+        >
+          <div
+            className="glass rounded-xl p-5 w-80 max-w-[90vw]"
+            onClick={(e) => e.stopPropagation()}
+            style={{ backgroundColor: 'var(--bg-sidebar)' }}
+          >
+            <h3 className="text-sm font-bold mb-2" style={{ color: 'var(--text-primary)' }}>
+              Delete Document
+            </h3>
+            <p className="text-xs mb-4" style={{ color: 'var(--text-secondary)' }}>
+              Are you sure you want to delete &ldquo;{documents.find(d => d.id === confirmDeleteId)?.title}&rdquo;? This cannot be undone.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setConfirmDeleteId(null)}
+                className="py-1.5 px-3 rounded-lg border text-xs font-medium hover:bg-[var(--bg-button-hover)] transition-colors duration-150"
+                style={{ borderColor: 'var(--border-color)', color: 'var(--text-secondary)' }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDeleteDoc}
+                className="py-1.5 px-3 rounded-lg text-xs font-semibold text-white bg-red-600 hover:bg-red-700 transition-colors duration-150"
+              >
+                Delete
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {toast && (
+        <div className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 animate-fade-in">
+          <div
+            className="glass rounded-lg px-4 py-2.5 text-xs font-medium"
+            style={{ backgroundColor: 'var(--bg-sidebar)', color: 'var(--text-primary)' }}
+          >
+            {toast}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
