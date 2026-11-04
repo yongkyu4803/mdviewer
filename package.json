@@ -8,9 +8,12 @@
     "start": "next start",
     "lint": "eslint",
     "test": "vitest run",
+    "test:webkit": "node scripts/test-webkit-parser.mjs",
     "tauri": "tauri",
     "desktop:dev": "tauri dev",
-    "desktop:build": "tauri build"
+    "desktop:build": "tauri build",
+    "desktop:build:windows": "tauri build --target x86_64-pc-windows-msvc --bundles nsis",
+    "desktop:build:windows:offline": "tauri build --target x86_64-pc-windows-msvc --bundles nsis --config src-tauri/tauri.windows-offline.conf.json"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

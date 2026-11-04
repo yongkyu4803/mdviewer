@@ -1,0 +1,75 @@
+name: Desktop builds
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      offline_windows:
+        description: Embed the WebView2 offline installer
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: Mark_md-windows-x64
+          - name: macOS Apple Silicon
+            os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: Mark_md-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+          components: rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+      - run: cargo fmt --manifest-path src-tauri/Cargo.toml --check
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib
+      - name: Check JavaScriptCore parser
+        if: runner.os == 'macOS'
+        run: npm run test:webkit
+      - name: Build Windows installer
+        if: runner.os == 'Windows' && !inputs.offline_windows
+        run: npm run desktop:build:windows
+      - name: Build offline Windows installer
+        if: runner.os == 'Windows' && inputs.offline_windows
+        run: npm run desktop:build:windows:offline
+      - name: Build macOS bundle
+        if: runner.os == 'macOS'
+        run: npm run desktop:build -- --target aarch64-apple-darwin --bundles dmg
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}${{ inputs.offline_windows && runner.os == 'Windows' && '-offline' || '' }}
+          path: |
+            src-tauri/target/${{ matrix.target }}/release/bundle/nsis/*-setup.exe
+            src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 14

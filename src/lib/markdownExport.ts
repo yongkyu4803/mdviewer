@@ -1,4 +1,7 @@
-import { marked, type Token, type Tokens } from 'marked';
+import { type Token, type Tokens } from 'marked';
+import { lexMarkdown, parseMarkdown } from './markdownParser';
+import { downloadBlob } from './fileDownload';
+import { exportFileName } from './filePaths';
 import { jsPDF } from 'jspdf';
 import html2canvas from 'html2canvas';
 import { measurePdfBands, paginatePdf, installPdfFontMetricsFix } from './pdfPagination';
@@ -163,22 +166,6 @@ function tokensToBlocks(tokens: Token[]): Block[] {
   return blocks;
 }
 
-function baseFileName(title: string): string {
-  const stripped = title.replace(/\.(md|markdown|txt)$/i, '').trim();
-  return stripped || 'document';
-}
-
-function downloadBlob(blob: Blob, filename: string) {
-  const url = URL.createObjectURL(blob);
-  const link = document.createElement('a');
-  link.href = url;
-  link.setAttribute('download', filename);
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  URL.revokeObjectURL(url);
-}
-
 // ---------------------------------------------------------------------------
 // PDF export
 // ---------------------------------------------------------------------------
@@ -245,7 +232,7 @@ const PDF_MARGIN_MM = 15;
 const PDF_CONTAINER_WIDTH_PX = Math.floor((210 - PDF_MARGIN_MM * 2) * 96 / 25.4);
 
 export async function exportMarkdownToPdf(title: string, markdown: string): Promise<void> {
-  const html = marked.parse(markdown) as string;
+  const html = parseMarkdown(markdown);
 
   const container = document.createElement('div');
   container.className = 'md-export-root';
@@ -293,7 +280,7 @@ export async function exportMarkdownToPdf(title: string, markdown: string): Prom
       canvas.height = 0;
     }
 
-    doc.save(`${baseFileName(title)}.pdf`);
+    await downloadBlob(doc.output('blob'), exportFileName(title, 'pdf'));
   } finally {
     restoreFontMetrics();
     document.body.removeChild(container);
@@ -419,7 +406,7 @@ function buildDocxTable(block: Extract<Block, { kind: 'table' }>): Table {
 }
 
 export async function exportMarkdownToDocx(title: string, markdown: string): Promise<void> {
-  const blocks = tokensToBlocks(marked.lexer(markdown));
+  const blocks = tokensToBlocks(lexMarkdown(markdown));
   const children = blocksToDocx(blocks);
 
   const doc = new Document({
@@ -446,5 +433,5 @@ export async function exportMarkdownToDocx(title: string, markdown: string): Pro
   });
 
   const blob = await Packer.toBlob(doc);
-  downloadBlob(blob, `${baseFileName(title)}.docx`);
+  await downloadBlob(blob, exportFileName(title, 'docx'));
 }

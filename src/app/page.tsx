@@ -1,8 +1,6 @@
 'use client';
 
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
-import { marked } from 'marked';
-import DOMPurify from 'dompurify';
 import { 
   FileText, 
   Plus, 
@@ -38,21 +36,19 @@ import {
   Loader2
 } from 'lucide-react';
 import { exportMarkdownToPdf, exportMarkdownToDocx } from '@/lib/markdownExport';
+import { loadDocuments, saveDocuments, type MarkdownDocument } from '@/lib/documentStore';
+import { renderMarkdownPreview } from '@/lib/markdownPreview';
+import { fileNameFromPath, exportFileName } from '@/lib/filePaths';
+import { downloadBlob } from '@/lib/fileDownload';
 import {
+  desktopMarkdownImageUrl,
   getStartupMarkdownPaths,
   isDesktopApp,
   onMarkdownOpened,
+  pickMarkdownPaths,
   readMarkdownPath,
   writeMarkdownPath,
 } from '@/lib/desktop';
-
-interface MarkdownDocument {
-  id: string;
-  title: string;
-  content: string;
-  updatedAt: string;
-  desktopFilePath?: string;
-}
 
 const DEFAULT_DOCUMENTS: MarkdownDocument[] = [
   {
@@ -70,7 +66,7 @@ This application has been crafted to provide a premium writing and reading exper
 
 - [x] **Dynamic Dual Views**: Seamlessly switch between **Viewer**, **Editor**, and **Split-Screen** modes.
 - [x] **File Manager**: Create, rename, delete, and manage multiple markdown notes.
-- [x] **LocalStorage Auto-Save**: Your drafts are safely stored locally in your browser.
+- [x] **Local Auto-Save**: Your drafts are safely stored locally in your browser.
 - [x] **Markdown Formatting Helper**: Use the interactive toolbar to insert tags instantly.
 - [x] **Import & Export**: Easily import local \`.md\` files or export your work to your computer.
 - [x] **Premium Design Themes**: Toggle between **Midnight Abyss** (dark mode) and **Nordic Frost** (light mode).
@@ -186,6 +182,10 @@ function greet() {
 
 export default function Home() {
   const [documents, setDocuments] = useState<MarkdownDocument[]>([]);
+  const [libraryLoaded, setLibraryLoaded] = useState(false);
+  const [savedDocuments, setSavedDocuments] = useState<MarkdownDocument[] | null>(null);
+  const [saveFailed, setSaveFailed] = useState(false);
+  const [fileSaveStates, setFileSaveStates] = useState<Record<string, 'saving' | 'saved' | 'error'>>({});
   const [activeDocId, setActiveDocId] = useState<string>('welcome');
   const [viewMode, setViewMode] = useState<'viewer' | 'editor' | 'split'>('viewer');
   const [theme, setTheme] = useState<'dark' | 'light'>('light');
@@ -200,21 +200,46 @@ export default function Home() {
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
   const sidebarExportRef = useRef<HTMLDivElement>(null);
   const headerExportRef = useRef<HTMLDivElement>(null);
   const saveTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const saveVersionsRef = useRef<Map<string, number>>(new Map());
+
+  const showToast = useCallback((message: string) => {
+    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+    setToast(message);
+    toastTimerRef.current = setTimeout(() => setToast(null), 3000);
+  }, []);
+
+  const saveDesktopFile = useCallback(async (path: string, content: string, version: number) => {
+    try {
+      await writeMarkdownPath(path, content);
+      if (saveVersionsRef.current.get(path) === version) {
+        setFileSaveStates((current) => ({ ...current, [path]: 'saved' }));
+      }
+    } catch (error) {
+      console.error('Could not save Markdown file:', error);
+      if (saveVersionsRef.current.get(path) === version) {
+        setFileSaveStates((current) => ({ ...current, [path]: 'error' }));
+        showToast(`Could not save ${fileNameFromPath(path)}. Check file permissions.`);
+      }
+      throw error;
+    }
+  }, [showToast]);
 
   const openDesktopPaths = useCallback(async (paths: string[]) => {
     for (const path of paths) {
       try {
         const content = await readMarkdownPath(path);
-        const title = path.split('/').pop() || 'Untitled.md';
+        const title = fileNameFromPath(path);
+        const linked = /\.(md|markdown)$/i.test(title);
         const document: MarkdownDocument = {
-          id: `file:${path}`,
-          title,
+          id: `${linked ? 'file' : 'import'}:${path}`,
+          title: linked ? title : `${title}.md`,
           content,
           updatedAt: new Date().toLocaleDateString(),
-          desktopFilePath: path,
+          desktopFilePath: linked ? path : undefined,
         };
         setDocuments((current) => [
           document,
@@ -224,56 +249,92 @@ export default function Home() {
         setViewMode('viewer');
       } catch (error) {
         console.error(`Could not open ${path}:`, error);
+        showToast(`Could not open ${fileNameFromPath(path)}.`);
       }
     }
-  }, []);
+  }, [showToast]);
 
-  // Initialize documents from LocalStorage or use defaults
+  // Migrate older libraries, and use IndexedDB for documents larger than the
+  // small synchronous localStorage quota.
   useEffect(() => {
-    const savedDocs = localStorage.getItem('markmd_documents');
-    const savedTheme = localStorage.getItem('markmd_theme') as 'dark' | 'light';
-    
-    if (savedDocs) {
-      try {
-        const parsed = JSON.parse(savedDocs);
-        if (parsed.length > 0) {
-          setDocuments(parsed);
-          setActiveDocId(parsed[0].id);
-        } else {
-          setDocuments(DEFAULT_DOCUMENTS);
-          localStorage.setItem('markmd_documents', JSON.stringify(DEFAULT_DOCUMENTS));
-        }
-      } catch (e) {
-        setDocuments(DEFAULT_DOCUMENTS);
-      }
-    } else {
-      setDocuments(DEFAULT_DOCUMENTS);
-      localStorage.setItem('markmd_documents', JSON.stringify(DEFAULT_DOCUMENTS));
-    }
-
-    if (savedTheme) {
-      setTheme(savedTheme);
-      document.documentElement.setAttribute('data-theme', savedTheme);
-    } else {
-      setTheme('light');
-      document.documentElement.setAttribute('data-theme', 'light');
-    }
-  }, []);
-
-  // macOS passes files opened from Finder to Tauri. This also receives files
-  // while the application is already running.
-  useEffect(() => {
-    if (!isDesktopApp()) return;
-
-    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    const savedTheme = localStorage.getItem('markmd_theme') === 'dark' ? 'dark' : 'light';
+    document.documentElement.setAttribute('data-theme', savedTheme);
     void (async () => {
-      unlisten = await onMarkdownOpened(openDesktopPaths);
-      const startupPaths = await getStartupMarkdownPaths();
-      await openDesktopPaths(startupPaths);
+      try {
+        const saved = await loadDocuments();
+        const restored = saved?.length ? saved : DEFAULT_DOCUMENTS;
+        if (isDesktopApp()) {
+          await Promise.all(restored.map(async (doc) => {
+            if (!doc.desktopFilePath) return;
+            try {
+              doc.content = await readMarkdownPath(doc.desktopFilePath);
+            } catch (error) {
+              console.error('Could not reopen Markdown file:', error);
+            }
+          }));
+        }
+        if (cancelled) return;
+        setDocuments(restored);
+        setActiveDocId(restored[0].id);
+        setTheme(savedTheme);
+      } catch (error) {
+        console.error('Could not load document library:', error);
+        if (cancelled) return;
+        setDocuments(DEFAULT_DOCUMENTS);
+      } finally {
+        if (!cancelled) setLibraryLoaded(true);
+      }
     })();
 
-    return () => unlisten?.();
-  }, [openDesktopPaths]);
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (!libraryLoaded) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      void saveDocuments(documents).then(() => {
+        if (!cancelled) {
+          setSavedDocuments(documents);
+          setSaveFailed(false);
+        }
+      }).catch((error) => {
+        console.error('Could not save document library:', error);
+        if (!cancelled) setSaveFailed(true);
+      });
+    }, 300);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [documents, libraryLoaded]);
+
+  // Register before draining the queue so early Explorer/Finder opens are not lost.
+  // Events are notifications; draining once prevents duplicate startup deliveries.
+  useEffect(() => {
+    if (!libraryLoaded || !isDesktopApp()) return;
+
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
+    let drain = Promise.resolve();
+    const drainFiles = () => {
+      drain = drain.then(async () => {
+        if (cancelled) return;
+        const paths = await getStartupMarkdownPaths();
+        if (!cancelled) await openDesktopPaths(paths);
+      }).catch((error) => {
+        console.error('Could not receive Markdown files:', error);
+        if (!cancelled) showToast('Could not receive the opened file. Try Import.');
+      });
+    };
+    void (async () => {
+      unlisten = await onMarkdownOpened(drainFiles);
+      if (cancelled) unlisten();
+      else drainFiles();
+    })().catch((error) => {
+      console.error('Could not listen for Markdown files:', error);
+    });
+
+    return () => { cancelled = true; unlisten?.(); };
+  }, [libraryLoaded, openDesktopPaths, showToast]);
 
   // Close the export format menu when clicking outside of it
   useEffect(() => {
@@ -301,26 +362,38 @@ export default function Home() {
     return documents.find(doc => doc.id === activeDocId) || documents[0] || null;
   }, [documents, activeDocId]);
 
-  // Compute live HTML from markdown safely
+  const activeContent = activeDoc?.content || '';
+  const activeFilePath = activeDoc?.desktopFilePath;
+  const fileSaveStatus = activeFilePath ? fileSaveStates[activeFilePath] : undefined;
+  const saveStatus = saveFailed || fileSaveStatus === 'error' ? 'error'
+    : savedDocuments !== documents || fileSaveStatus === 'saving' ? 'saving' : 'saved';
+
+  useEffect(() => {
+    previewRef.current?.scrollTo(0, 0);
+  }, [activeDocId]);
+
+  // Compute live HTML from markdown safely, preserving converted HTML tables.
   const renderedHtml = useMemo(() => {
-    if (!activeDoc) return '';
+    if (!activeContent) return '';
     try {
-      // marked parses synchronous and yields raw HTML string
-      return DOMPurify.sanitize(marked.parse(activeDoc.content) as string);
-    } catch (e) {
+      return renderMarkdownPreview(activeContent, activeFilePath && isDesktopApp()
+        ? (source) => desktopMarkdownImageUrl(source, activeFilePath)
+        : undefined);
+    } catch (error) {
+      console.error('Could not render Markdown:', error);
       return '<p style="color:red;">Error parsing Markdown content.</p>';
     }
-  }, [activeDoc?.content]);
+  }, [activeContent, activeFilePath]);
 
   // Document metadata calculations
   const stats = useMemo(() => {
-    if (!activeDoc) return { words: 0, characters: 0, readTime: 0 };
-    const text = activeDoc.content.trim();
+    if (!activeContent) return { words: 0, characters: 0, readTime: 0 };
+    const text = activeContent.trim();
     const words = text === '' ? 0 : text.split(/\s+/).length;
     const characters = text.length;
     const readTime = Math.max(1, Math.ceil(words / 200)); // Estimated 200 WPM
     return { words, characters, readTime };
-  }, [activeDoc?.content]);
+  }, [activeContent]);
 
   // Save active document state on change
   const updateActiveDocContent = (newContent: string) => {
@@ -336,14 +409,16 @@ export default function Home() {
       return doc;
     });
     setDocuments(updated);
-    localStorage.setItem('markmd_documents', JSON.stringify(updated));
     if (activeDoc.desktopFilePath) {
-      const existingTimer = saveTimersRef.current.get(activeDoc.desktopFilePath);
+      const path = activeDoc.desktopFilePath;
+      const existingTimer = saveTimersRef.current.get(path);
       if (existingTimer) clearTimeout(existingTimer);
-      saveTimersRef.current.set(activeDoc.desktopFilePath, setTimeout(() => {
-        void writeMarkdownPath(activeDoc.desktopFilePath!, newContent).catch((error) => {
-          console.error('Could not save Markdown file:', error);
-        });
+      const version = (saveVersionsRef.current.get(path) ?? 0) + 1;
+      saveVersionsRef.current.set(path, version);
+      setFileSaveStates((current) => ({ ...current, [path]: 'saving' }));
+      saveTimersRef.current.set(path, setTimeout(() => {
+        saveTimersRef.current.delete(path);
+        void saveDesktopFile(path, newContent, version).catch(() => undefined);
       }, 400));
     }
   };
@@ -354,14 +429,13 @@ export default function Home() {
       if (doc.id === activeDocId) {
         return {
           ...doc,
-          title: newTitle.endsWith('.md') ? newTitle : `${newTitle}.md`,
+          title: /\.(md|markdown)$/i.test(newTitle) ? newTitle : `${newTitle}.md`,
           updatedAt: new Date().toLocaleDateString()
         };
       }
       return doc;
     });
     setDocuments(updated);
-    localStorage.setItem('markmd_documents', JSON.stringify(updated));
   };
 
   // Document Action Helpers
@@ -376,16 +450,6 @@ export default function Home() {
     setDocuments(updated);
     setActiveDocId(newDoc.id);
     setViewMode('editor'); // transition to editor for immediate writing
-    localStorage.setItem('markmd_documents', JSON.stringify(updated));
-  };
-
-  // window.confirm()/alert() render nothing in the desktop app's WKWebView (it has no
-  // WKUIDelegate wired up for JS dialogs), so they silently no-op there instead of
-  // blocking for input. Use an in-app modal/toast instead — works in the browser too.
-  const showToast = (message: string) => {
-    if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
-    setToast(message);
-    toastTimerRef.current = setTimeout(() => setToast(null), 3000);
   };
 
   const requestDeleteDoc = (id: string, e: React.MouseEvent) => {
@@ -405,29 +469,32 @@ export default function Home() {
     if (activeDocId === id) {
       setActiveDocId(updated[0].id);
     }
-    localStorage.setItem('markmd_documents', JSON.stringify(updated));
     setConfirmDeleteId(null);
   };
 
   const exportDoc = async () => {
     if (!activeDoc) return;
     if (activeDoc.desktopFilePath && isDesktopApp()) {
-      try {
-        await writeMarkdownPath(activeDoc.desktopFilePath, activeDoc.content);
-      } catch (error) {
-        console.error('Could not save Markdown file:', error);
-        showToast('Could not save the Markdown file.');
-      }
+      const path = activeDoc.desktopFilePath;
+      clearTimeout(saveTimersRef.current.get(path));
+      saveTimersRef.current.delete(path);
+      const version = (saveVersionsRef.current.get(path) ?? 0) + 1;
+      saveVersionsRef.current.set(path, version);
+      setFileSaveStates((current) => ({ ...current, [path]: 'saving' }));
+      await saveDesktopFile(path, activeDoc.content, version).catch(() => undefined);
       return;
     }
     const blob = new Blob([activeDoc.content], { type: 'text/markdown;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', activeDoc.title);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
+    const path = await downloadBlob(blob, exportFileName(activeDoc.title, 'md'));
+    if (path) {
+      const id = `file:${path}`;
+      setDocuments((current) => current
+        .filter((doc) => doc.id === activeDoc.id || doc.id !== id)
+        .map((doc) => doc.id === activeDoc.id
+          ? { ...doc, id, title: fileNameFromPath(path), desktopFilePath: path }
+          : doc));
+      setActiveDocId(id);
+    }
   };
 
   const handleExport = async (format: 'md' | 'pdf' | 'docx') => {
@@ -435,7 +502,11 @@ export default function Home() {
     if (!activeDoc) return;
 
     if (format === 'md') {
-      await exportDoc();
+      try { await exportDoc(); }
+      catch (error) {
+        console.error('Could not export Markdown:', error);
+        showToast('Could not save the Markdown file.');
+      }
       return;
     }
 
@@ -454,6 +525,19 @@ export default function Home() {
     }
   };
 
+  const openDocumentPicker = async () => {
+    if (!isDesktopApp()) {
+      fileInputRef.current?.click();
+      return;
+    }
+    try {
+      await openDesktopPaths(await pickMarkdownPaths());
+    } catch (error) {
+      console.error('Could not select Markdown files:', error);
+      showToast('Could not open the file picker.');
+    }
+  };
+
   const importDoc = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
@@ -464,15 +548,16 @@ export default function Home() {
       const content = event.target?.result as string;
       const newDoc: MarkdownDocument = {
         id: `doc_${Date.now()}`,
-        title: file.name.endsWith('.md') ? file.name : `${file.name}.md`,
+        title: /\.(md|markdown)$/i.test(file.name) ? file.name : `${file.name}.md`,
         content: content,
         updatedAt: new Date().toLocaleDateString()
       };
       const updated = [newDoc, ...documents];
       setDocuments(updated);
       setActiveDocId(newDoc.id);
-      localStorage.setItem('markmd_documents', JSON.stringify(updated));
+      setViewMode('viewer');
     };
+    reader.onerror = () => showToast('Could not read the Markdown file.');
     reader.readAsText(file);
     // Reset file input value
     if (fileInputRef.current) fileInputRef.current.value = '';
@@ -601,7 +686,7 @@ export default function Home() {
           
           <div className="grid grid-cols-2 gap-2 mt-1">
             <button
-              onClick={() => fileInputRef.current?.click()}
+              onClick={() => void openDocumentPicker()}
               className="flex items-center justify-center gap-1.5 py-2 px-3 rounded-lg border text-xs font-medium hover:bg-[var(--bg-button-hover)] transition-colors duration-150"
               style={{ borderColor: 'var(--border-color)', color: 'var(--text-secondary)', backgroundColor: 'var(--bg-sidebar)' }}
             >
@@ -612,7 +697,7 @@ export default function Home() {
               type="file" 
               ref={fileInputRef} 
               onChange={importDoc} 
-              accept=".md,.txt" 
+              accept=".md,.markdown,.txt"
               className="hidden" 
             />
             
@@ -712,7 +797,9 @@ export default function Home() {
         <div className="px-5 py-4 border-t flex items-center justify-between" style={{ borderColor: 'var(--border-color)' }}>
           <div className="flex items-center gap-2">
             <div className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'var(--accent-success)' }} />
-            <span className="text-xs font-medium" style={{ color: 'var(--text-muted)' }}>Saved</span>
+            <span className="text-xs font-medium" role="status" style={{ color: saveStatus === 'error' ? '#dc2626' : 'var(--text-muted)' }}>
+              {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'error' ? 'Save failed' : 'Saved'}
+            </span>
           </div>
 
           <button
@@ -754,7 +841,7 @@ export default function Home() {
             <div className="flex flex-col justify-center min-w-0">
               <input 
                 type="text" 
-                value={activeDoc?.title.replace(/\.md$/, '') || ''} 
+                value={activeDoc?.title.replace(/\.(md|markdown)$/i, '') || ''}
                 onChange={(e) => updateActiveDocTitle(e.target.value)}
                 placeholder="Rename file..."
                 className="text-base font-bold bg-transparent border-b border-transparent hover:border-[var(--border-color)] focus:border-[var(--accent-primary)] focus:outline-none transition-colors py-0.5 truncate select-text w-48"
@@ -870,12 +957,12 @@ export default function Home() {
         )}
 
         {/* Content Panel Body */}
-        <div className="flex-1 flex overflow-hidden w-full relative">
+        <div className="flex-1 min-h-0 flex overflow-hidden w-full relative">
           
           {/* EDITOR WORKSPACE */}
           {(viewMode === 'editor' || viewMode === 'split') && (
             <div 
-              className="flex-1 h-full overflow-hidden flex relative"
+              className="flex-1 min-w-0 h-full overflow-hidden flex relative"
               style={{ backgroundColor: 'var(--bg-editor)' }}
             >
               <textarea 
@@ -906,7 +993,8 @@ export default function Home() {
           {/* VIEWER PREVIEW WORKSPACE */}
           {(viewMode === 'viewer' || viewMode === 'split') && (
             <div
-              className="flex-1 h-full overflow-y-auto animate-fade-in relative"
+              ref={previewRef}
+              className="flex-1 min-w-0 h-full overflow-y-auto animate-fade-in relative"
               style={{ backgroundColor: 'var(--bg-preview)', padding: '48px 56px' }}
             >
               {activeDoc ? (
@@ -972,7 +1060,7 @@ export default function Home() {
               <div>
                 <h4 className="font-bold mb-1.5">Code Snippets</h4>
                 <code className="block p-2 rounded font-mono" style={{ backgroundColor: 'var(--bg-item-active)', color: 'var(--text-secondary)' }}>\`inline code\`</code>
-                <code className="block p-2 mt-1 rounded font-mono" style={{ backgroundColor: 'var(--bg-item-active)', color: 'var(--text-secondary)' }}>\\\`\\\`\\\`javascript<br/>// JS Code Block<br/>\\\`\\\`\\\`</code>
+                <code className="block p-2 mt-1 rounded font-mono" style={{ backgroundColor: 'var(--bg-item-active)', color: 'var(--text-secondary)' }}>\\\`\\\`\\\`javascript<br/>{'// JS Code Block'}<br/>\\\`\\\`\\\`</code>
               </div>
             </div>
           </div>
