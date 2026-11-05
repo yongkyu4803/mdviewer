@@ -1,5 +1,6 @@
 import { type Token, type Tokens } from 'marked';
-import { lexMarkdown, parseMarkdown } from './markdownParser';
+import { lexMarkdownAsync, parseMarkdownAsync } from './markdownAsync';
+import { sanitizeDocumentHtml, safeLinkUrl } from './documentSecurity';
 import { downloadBlob } from './fileDownload';
 import { exportFileName } from './filePaths';
 import { jsPDF } from 'jspdf';
@@ -81,7 +82,7 @@ function flattenInline(tokens: Token[] | undefined, style: Omit<Run, 'text'> = {
         break;
       case 'link': {
         const lt = t as Tokens.Link;
-        runs.push(...flattenInline(lt.tokens, { ...style, link: lt.href }));
+        runs.push(...flattenInline(lt.tokens, { ...style, link: safeLinkUrl(lt.href) }));
         break;
       }
       case 'image': {
@@ -231,12 +232,14 @@ function pdfPrintCss(): string {
 const PDF_MARGIN_MM = 15;
 const PDF_CONTAINER_WIDTH_PX = Math.floor((210 - PDF_MARGIN_MM * 2) * 96 / 25.4);
 
-export async function exportMarkdownToPdf(title: string, markdown: string): Promise<void> {
-  const html = parseMarkdown(markdown);
+export async function exportMarkdownToPdf(title: string, markdown: string, images: Readonly<Record<string, string>> = {}): Promise<void> {
+  const html = await parseMarkdownAsync(markdown);
 
   const container = document.createElement('div');
   container.className = 'md-export-root';
-  container.innerHTML = `<style>${pdfPrintCss()}</style>${html}`;
+  const style = document.createElement('style');
+  style.textContent = pdfPrintCss();
+  container.append(style, sanitizeDocumentHtml(html, images));
   Object.assign(container.style, {
     position: 'fixed',
     top: '0',
@@ -259,9 +262,12 @@ export async function exportMarkdownToPdf(title: string, markdown: string): Prom
     const pageHeightPx = Math.floor(contentHeight / pxToMm);
     const height = Math.ceil(container.getBoundingClientRect().height);
     const pages = paginatePdf(height, pageHeightPx, measurePdfBands(container, pageHeightPx));
+    if (pages.length > 200) throw new Error('PDF export is limited to 200 pages. Split the document.');
+    const started = Date.now();
 
     // Render one page at a time: line-aware cuts and no browser tall-canvas limit.
     for (const [index, page] of pages.entries()) {
+      if (Date.now() - started > 60_000) throw new Error('PDF export exceeded one minute. Split the document.');
       const sliceHeight = page.bottom - page.top;
       const canvas = await html2canvas(container, {
         backgroundColor: '#ffffff',
@@ -406,7 +412,7 @@ function buildDocxTable(block: Extract<Block, { kind: 'table' }>): Table {
 }
 
 export async function exportMarkdownToDocx(title: string, markdown: string): Promise<void> {
-  const blocks = tokensToBlocks(lexMarkdown(markdown));
+  const blocks = tokensToBlocks(await lexMarkdownAsync(markdown));
   const children = blocksToDocx(blocks);
 
   const doc = new Document({

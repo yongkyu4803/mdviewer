@@ -54,9 +54,33 @@ criteria, not a claim that a Windows machine has already passed them.
 - Build the Apple Silicon app and run `npm run test:webkit`.
 - Verify Finder first/second opens, Import, relative images, autosave and all three
   export formats, including cancelling the native dialogs.
+- Confirm `.txt` and source files are not claimed by Mark_md after installation and
+  that macOS versions earlier than 14 refuse to launch the bundle.
 
 ## Distribution
 
 - For external distribution, configure signing credentials and check signature
   validity. Verify actual behavior under the intended Windows security settings;
   a successful unsigned build is not proof that those machines will allow it.
+
+## Security regression checks (2026-11-05)
+
+- Open/import/save using Korean names, then restart: restored drafts must not gain native file access until reopened with Import.
+- Edit the original file with another program while Mark_md is open. Mark_md must show Save failed and preserve the external edit.
+- Test NTFS symlink/junction/reparse-point replacement in a disposable fixture directory. Native saves must not redirect to an unapproved target; no other files may be touched.
+- Preview and export the harmless event-handler/CSS sample in the security report. No script, global CSS or automatic external-image request may execute.
+- Verify local PNG/JPEG/WebP inside the document directory, and rejection of traversal, SVG/GIF, fake images and oversized images.
+- Verify local-draft opt-in, full saved-copy deletion, native save-dialog cancellation and read-only files.
+- Verify PDF and DOCX exports under WebView2 with CSP enabled. DOCX must not contain javascript/file link relationships.
+- Release candidates must pass Authenticode signer and timestamp checks; unsigned-test artifacts are not signed releases.
+
+## Security regression checks (2026-11-05, second review)
+
+- Second launch: opening another document while the app runs must reach the existing window (single-instance plugin, Windows only).
+- While a document is open, renaming or deleting its folder is refused by Windows (the app holds the approved directory handle). After closing the document in Mark_md, the folder can be renamed again.
+- Export a PDF of at least 100 pages and a DOCX to a Korean path; the save completes without the window freezing (raw IPC body instead of a JSON byte array).
+- Type continuously in a document that references many large local images; typing stays responsive and images remain visible.
+- Select several files in Import where one exceeds 8 MiB: none open, the message names the failing file, and already open documents keep saving.
+- Edit an open document, change the file externally, wait for Save failed, then reopen it: the disk version is shown and the edits remain in a separate `(unsaved edits)` draft.
+
+Record the tested commit, Windows/WebView2 versions and outcomes in [SECURITY.md](../SECURITY.md). Configuration and macOS results do not substitute for this checklist.

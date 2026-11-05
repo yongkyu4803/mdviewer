@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-take-pending-markdown-files"
+description = "Enables the take_pending_markdown_files command without any pre-configured scope."
+commands.allow = ["take_pending_markdown_files"]
+
+[[permission]]
+identifier = "deny-take-pending-markdown-files"
+description = "Denies the take_pending_markdown_files command without any pre-configured scope."
+commands.deny = ["take_pending_markdown_files"]

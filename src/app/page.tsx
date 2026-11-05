@@ -36,12 +36,13 @@ import {
   Loader2
 } from 'lucide-react';
 import { exportMarkdownToPdf, exportMarkdownToDocx } from '@/lib/markdownExport';
-import { loadDocuments, saveDocuments, type MarkdownDocument } from '@/lib/documentStore';
-import { renderMarkdownPreview } from '@/lib/markdownPreview';
+import { loadDocuments, saveDocuments, clearSavedDocuments, type MarkdownDocument } from '@/lib/documentStore';
+import { renderParsedPreview } from '@/lib/markdownPreview';
 import { fileNameFromPath, exportFileName } from '@/lib/filePaths';
 import { downloadBlob } from '@/lib/fileDownload';
 import {
-  desktopMarkdownImageUrl,
+  readDocumentImages,
+  closeMarkdownPath,
   getStartupMarkdownPaths,
   isDesktopApp,
   onMarkdownOpened,
@@ -49,6 +50,11 @@ import {
   readMarkdownPath,
   writeMarkdownPath,
 } from '@/lib/desktop';
+
+import { parseMarkdownAsync } from '@/lib/markdownAsync';
+import { assertDocumentSize, localImageSources, MAX_DOCUMENT_BYTES, MAX_DOCUMENTS } from '@/lib/documentSecurity';
+import { DocumentImageCache } from '@/lib/documentImages';
+import { mergeReopenedDocument } from '@/lib/reopenDocument';
 
 const DEFAULT_DOCUMENTS: MarkdownDocument[] = [
   {
@@ -66,7 +72,7 @@ This application has been crafted to provide a premium writing and reading exper
 
 - [x] **Dynamic Dual Views**: Seamlessly switch between **Viewer**, **Editor**, and **Split-Screen** modes.
 - [x] **File Manager**: Create, rename, delete, and manage multiple markdown notes.
-- [x] **Local Auto-Save**: Your drafts are safely stored locally in your browser.
+- [x] **Optional Local Drafts**: Enable **Keep drafts after closing** to retain copies on this device.
 - [x] **Markdown Formatting Helper**: Use the interactive toolbar to insert tags instantly.
 - [x] **Import & Export**: Easily import local \`.md\` files or export your work to your computer.
 - [x] **Premium Design Themes**: Toggle between **Midnight Abyss** (dark mode) and **Nordic Frost** (light mode).
@@ -113,7 +119,7 @@ We have custom-designed table aesthetics:
 
 1. Click on **Split-Screen** in the header to see your updates render in real-time as you write!
 2. Use the **Cheatsheet** button \`( ? )\` in the top-right whenever you forget any Markdown syntax.
-3. Your document auto-saves instantly every time you type!
+3. Files opened in the desktop app save after a short pause. Enable **Keep drafts after closing** to retain other drafts, and wait for **Saved** before closing.
 
 *Start editing this document by clicking on the **Editor** tab above, or create a brand-new draft using the **New Document** button in the sidebar!*`,
     updatedAt: new Date().toLocaleDateString(),
@@ -183,6 +189,9 @@ function greet() {
 export default function Home() {
   const [documents, setDocuments] = useState<MarkdownDocument[]>([]);
   const [libraryLoaded, setLibraryLoaded] = useState(false);
+  const [rememberDrafts, setRememberDrafts] = useState(false);
+  const [confirmClearLibrary, setConfirmClearLibrary] = useState(false);
+  const [preview, setPreview] = useState<{ content: string; path?: string; html: string; images: Record<string, string> }>({ content: '', html: '', images: {} });
   const [savedDocuments, setSavedDocuments] = useState<MarkdownDocument[] | null>(null);
   const [saveFailed, setSaveFailed] = useState(false);
   const [fileSaveStates, setFileSaveStates] = useState<Record<string, 'saving' | 'saved' | 'error'>>({});
@@ -191,7 +200,7 @@ export default function Home() {
   const [theme, setTheme] = useState<'dark' | 'light'>('light');
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [cheatsheetOpen, setCheatsheetOpen] = useState(false);
-  const [activeLine, setActiveLine] = useState<number | null>(null);
+  const [, setActiveLine] = useState<number | null>(null);
   const [exportMenu, setExportMenu] = useState<'sidebar' | 'header' | null>(null);
   const [exportingFormat, setExportingFormat] = useState<'pdf' | 'docx' | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -204,7 +213,12 @@ export default function Home() {
   const sidebarExportRef = useRef<HTMLDivElement>(null);
   const headerExportRef = useRef<HTMLDivElement>(null);
   const saveTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+  const documentsRef = useRef(documents);
+  useEffect(() => { documentsRef.current = documents; }, [documents]);
   const saveVersionsRef = useRef<Map<string, number>>(new Map());
+  // Desktop files with edits that have not been written successfully yet.
+  const unsavedPathsRef = useRef<Set<string>>(new Set());
+  const [imageCache] = useState(() => new DocumentImageCache(readDocumentImages));
 
   const showToast = useCallback((message: string) => {
     if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
@@ -216,13 +230,14 @@ export default function Home() {
     try {
       await writeMarkdownPath(path, content);
       if (saveVersionsRef.current.get(path) === version) {
+        unsavedPathsRef.current.delete(path);
         setFileSaveStates((current) => ({ ...current, [path]: 'saved' }));
       }
     } catch (error) {
       console.error('Could not save Markdown file:', error);
       if (saveVersionsRef.current.get(path) === version) {
         setFileSaveStates((current) => ({ ...current, [path]: 'error' }));
-        showToast(`Could not save ${fileNameFromPath(path)}. Check file permissions.`);
+        showToast(`Could not save ${fileNameFromPath(path)}. ${String(error)}`);
       }
       throw error;
     }
@@ -231,9 +246,14 @@ export default function Home() {
   const openDesktopPaths = useCallback(async (paths: string[]) => {
     for (const path of paths) {
       try {
+        clearTimeout(saveTimersRef.current.get(path));
+        saveTimersRef.current.delete(path);
+        saveVersionsRef.current.set(path, (saveVersionsRef.current.get(path) ?? 0) + 1);
         const content = await readMarkdownPath(path);
+        assertDocumentSize(content);
         const title = fileNameFromPath(path);
         const linked = /\.(md|markdown)$/i.test(title);
+        if (!linked) await closeMarkdownPath(path);
         const document: MarkdownDocument = {
           id: `${linked ? 'file' : 'import'}:${path}`,
           title: linked ? title : `${title}.md`,
@@ -241,18 +261,28 @@ export default function Home() {
           updatedAt: new Date().toLocaleDateString(),
           desktopFilePath: linked ? path : undefined,
         };
-        setDocuments((current) => [
-          document,
-          ...current.filter((item) => item.id !== document.id),
-        ]);
+        const merged = mergeReopenedDocument(documentsRef.current, document,
+          linked && unsavedPathsRef.current.has(path), `doc_${crypto.randomUUID()}`);
+        if (merged.documents.length > MAX_DOCUMENTS) {
+          await closeMarkdownPath(path);
+          showToast('Library is limited to 128 documents. Remove a document and try again.');
+          continue;
+        }
+        unsavedPathsRef.current.delete(path);
+        imageCache.invalidate(path);
+        documentsRef.current = merged.documents;
+        setDocuments(documentsRef.current);
         setActiveDocId(document.id);
         setViewMode('viewer');
+        setFileSaveStates((current) => ({ ...current, [path]: 'saved' }));
+        if (merged.recovered) showToast(`Unsaved edits to ${title} were kept as a separate draft.`);
       } catch (error) {
         console.error(`Could not open ${path}:`, error);
-        showToast(`Could not open ${fileNameFromPath(path)}.`);
+        if (unsavedPathsRef.current.has(path)) setFileSaveStates((current) => ({ ...current, [path]: 'error' }));
+        showToast(`Could not open ${fileNameFromPath(path)}. ${String(error)}`);
       }
     }
-  }, [showToast]);
+  }, [imageCache, showToast]);
 
   // Migrate older libraries, and use IndexedDB for documents larger than the
   // small synchronous localStorage quota.
@@ -264,23 +294,18 @@ export default function Home() {
       try {
         const saved = await loadDocuments();
         const restored = saved?.length ? saved : DEFAULT_DOCUMENTS;
-        if (isDesktopApp()) {
-          await Promise.all(restored.map(async (doc) => {
-            if (!doc.desktopFilePath) return;
-            try {
-              doc.content = await readMarkdownPath(doc.desktopFilePath);
-            } catch (error) {
-              console.error('Could not reopen Markdown file:', error);
-            }
-          }));
-        }
+        // Restored drafts are copies; only a fresh OS open/dialog grants disk access.
+        const preference = localStorage.getItem('markmd_remember');
+        const remember = preference === 'on' || (preference === null && !!saved?.length);
         if (cancelled) return;
+        setRememberDrafts(remember);
         setDocuments(restored);
         setActiveDocId(restored[0].id);
         setTheme(savedTheme);
       } catch (error) {
         console.error('Could not load document library:', error);
         if (cancelled) return;
+        showToast('Could not restore drafts. Existing saved data was kept; draft saving is disabled.');
         setDocuments(DEFAULT_DOCUMENTS);
       } finally {
         if (!cancelled) setLibraryLoaded(true);
@@ -288,10 +313,11 @@ export default function Home() {
     })();
 
     return () => { cancelled = true; };
-  }, []);
+  }, [showToast]);
 
   useEffect(() => {
     if (!libraryLoaded) return;
+    if (!rememberDrafts) return;
     let cancelled = false;
     const timer = setTimeout(() => {
       void saveDocuments(documents).then(() => {
@@ -305,7 +331,7 @@ export default function Home() {
       });
     }, 300);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [documents, libraryLoaded]);
+  }, [documents, libraryLoaded, rememberDrafts]);
 
   // Register before draining the queue so early Explorer/Finder opens are not lost.
   // Events are notifications; draining once prevents duplicate startup deliveries.
@@ -364,26 +390,39 @@ export default function Home() {
 
   const activeContent = activeDoc?.content || '';
   const activeFilePath = activeDoc?.desktopFilePath;
+  const previewIsCurrent = preview.content === activeContent && preview.path === activeFilePath;
+  const renderedHtml = previewIsCurrent ? preview.html : '';
+  const documentImages = previewIsCurrent ? preview.images : {};
   const fileSaveStatus = activeFilePath ? fileSaveStates[activeFilePath] : undefined;
   const saveStatus = saveFailed || fileSaveStatus === 'error' ? 'error'
-    : savedDocuments !== documents || fileSaveStatus === 'saving' ? 'saving' : 'saved';
+    : (rememberDrafts && savedDocuments !== documents) || fileSaveStatus === 'saving' ? 'saving' : 'saved';
 
   useEffect(() => {
     previewRef.current?.scrollTo(0, 0);
   }, [activeDocId]);
 
-  // Compute live HTML from markdown safely, preserving converted HTML tables.
-  const renderedHtml = useMemo(() => {
-    if (!activeContent) return '';
-    try {
-      return renderMarkdownPreview(activeContent, activeFilePath && isDesktopApp()
-        ? (source) => desktopMarkdownImageUrl(source, activeFilePath)
-        : undefined);
-    } catch (error) {
-      console.error('Could not render Markdown:', error);
-      return '<p style="color:red;">Error parsing Markdown content.</p>';
-    }
-  }, [activeContent, activeFilePath]);
+  // Parsing runs in a cancellable worker. Only sanitized output enters the UI.
+  useEffect(() => {
+    const controller = new AbortController();
+    if (!activeContent) return () => controller.abort();
+    const timer = setTimeout(() => {
+      void (async () => {
+        const html = await parseMarkdownAsync(activeContent, controller.signal);
+        let images: Record<string, string> = {};
+        if (activeFilePath && isDesktopApp()) {
+          // Text edits reuse the images already read for the same image list.
+          images = await imageCache.load(activeFilePath, localImageSources(html));
+        }
+        if (controller.signal.aborted) return;
+        setPreview({ content: activeContent, path: activeFilePath, images, html: renderParsedPreview(html, images, activeContent.length) });
+      })().catch((error) => {
+        if (controller.signal.aborted) return;
+        console.error('Could not render Markdown:', error);
+        setPreview({ content: activeContent, path: activeFilePath, images: {}, html: '<p>Preview unavailable. Reopen the document or reduce its size.</p>' });
+      });
+    }, 150);
+    return () => { clearTimeout(timer); controller.abort(); };
+  }, [activeContent, activeFilePath, imageCache]);
 
   // Document metadata calculations
   const stats = useMemo(() => {
@@ -398,6 +437,7 @@ export default function Home() {
   // Save active document state on change
   const updateActiveDocContent = (newContent: string) => {
     if (!activeDoc) return;
+    try { assertDocumentSize(newContent); } catch { showToast('Documents must be 8 MiB or smaller.'); return; }
     const updated = documents.map(doc => {
       if (doc.id === activeDocId) {
         return {
@@ -411,6 +451,7 @@ export default function Home() {
     setDocuments(updated);
     if (activeDoc.desktopFilePath) {
       const path = activeDoc.desktopFilePath;
+      unsavedPathsRef.current.add(path);
       const existingTimer = saveTimersRef.current.get(path);
       if (existingTimer) clearTimeout(existingTimer);
       const version = (saveVersionsRef.current.get(path) ?? 0) + 1;
@@ -440,6 +481,7 @@ export default function Home() {
 
   // Document Action Helpers
   const createNewDoc = () => {
+    if (documents.length >= MAX_DOCUMENTS) { showToast('Library is limited to 128 documents.'); return; }
     const newDoc: MarkdownDocument = {
       id: `doc_${Date.now()}`,
       title: `Untitled_${documents.length + 1}.md`,
@@ -464,6 +506,14 @@ export default function Home() {
   const confirmDeleteDoc = () => {
     if (!confirmDeleteId) return;
     const id = confirmDeleteId;
+    const path = documents.find((doc) => doc.id === id)?.desktopFilePath;
+    if (path) {
+      clearTimeout(saveTimersRef.current.get(path));
+      saveTimersRef.current.delete(path);
+      unsavedPathsRef.current.delete(path);
+      imageCache.invalidate(path);
+      void closeMarkdownPath(path).catch(() => showToast('Could not release document access.'));
+    }
     const updated = documents.filter(doc => doc.id !== id);
     setDocuments(updated);
     if (activeDocId === id) {
@@ -513,19 +563,20 @@ export default function Home() {
     setExportingFormat(format);
     try {
       if (format === 'pdf') {
-        await exportMarkdownToPdf(activeDoc.title, activeDoc.content);
+        await exportMarkdownToPdf(activeDoc.title, activeDoc.content, documentImages);
       } else {
         await exportMarkdownToDocx(activeDoc.title, activeDoc.content);
       }
     } catch (err) {
       console.error('Export failed:', err);
-      showToast('Something went wrong while exporting. Please try again.');
+      showToast(`Export failed. ${String(err)}`);
     } finally {
       setExportingFormat(null);
     }
   };
 
   const openDocumentPicker = async () => {
+    if (documents.length >= MAX_DOCUMENTS) { showToast('Library is limited to 128 documents.'); return; }
     if (!isDesktopApp()) {
       fileInputRef.current?.click();
       return;
@@ -534,7 +585,7 @@ export default function Home() {
       await openDesktopPaths(await pickMarkdownPaths());
     } catch (error) {
       console.error('Could not select Markdown files:', error);
-      showToast('Could not open the file picker.');
+      showToast(`Could not open the selected files. ${String(error)}`);
     }
   };
 
@@ -543,9 +594,15 @@ export default function Home() {
     if (!files || files.length === 0) return;
     
     const file = files[0];
+    if (file.size > MAX_DOCUMENT_BYTES || documents.length >= MAX_DOCUMENTS || !/\.(md|markdown|txt)$/i.test(file.name)) {
+      showToast('Import Markdown/text files up to 8 MiB; library limit is 128 documents.');
+      e.target.value = '';
+      return;
+    }
     const reader = new FileReader();
     reader.onload = (event) => {
       const content = event.target?.result as string;
+      try { assertDocumentSize(content); } catch { showToast('Document exceeds 8 MiB.'); return; }
       const newDoc: MarkdownDocument = {
         id: `doc_${Date.now()}`,
         title: /\.(md|markdown)$/i.test(file.name) ? file.name : `${file.name}.md`,
@@ -635,6 +692,24 @@ export default function Home() {
       style={{ backgroundColor: 'var(--bg-app)', padding: '20px' }}
     >
       <div className="flex flex-1 overflow-hidden relative rounded-xl" style={{ border: '1px solid var(--border-color)', boxShadow: 'var(--app-shadow-lg)' }}>
+      {confirmClearLibrary && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40" role="dialog" aria-modal="true" aria-labelledby="clear-drafts-title">
+          <div className="rounded-xl p-6 max-w-md" style={{ background: 'var(--bg-sidebar)', color: 'var(--text-primary)' }}>
+            <h2 id="clear-drafts-title" className="font-bold mb-3">Clear saved copies?</h2>
+            <p className="text-sm">This removes all drafts saved inside Mark_md and turns off draft retention. Open documents stay in memory until you close the app. Original files are kept.</p>
+            <div className="flex justify-end gap-4 mt-5">
+              <button onClick={() => setConfirmClearLibrary(false)}>Cancel</button>
+              <button onClick={() => {
+                localStorage.setItem('markmd_remember', 'off');
+                setRememberDrafts(false);
+                setConfirmClearLibrary(false);
+                void clearSavedDocuments().then(() => { setSaveFailed(false); showToast('Saved copies cleared. Drafts are session only.'); })
+                  .catch(() => { setSaveFailed(true); showToast('Could not clear saved copies. Try again.'); });
+              }}>Clear copies</button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Sidebar Panel */}
       <div 
         className={`h-full flex flex-col z-20 shrink-0 relative transition-all duration-300 ${
@@ -793,12 +868,25 @@ export default function Home() {
           })}
         </div>
 
+        <details className="px-5 py-3 text-xs" style={{ color: 'var(--text-secondary)' }}>
+          <summary className="cursor-pointer">Privacy &amp; local drafts</summary>
+          <p className="mt-2">External images are blocked. Saved drafts stay on this device and are not encrypted by the app.</p>
+          <label className="flex gap-2 mt-3">
+            <input type="checkbox" checked={rememberDrafts} onChange={(event) => {
+              if (!event.target.checked) { setConfirmClearLibrary(true); return; }
+              localStorage.setItem('markmd_remember', 'on');
+              setRememberDrafts(true);
+            }} /> Keep drafts after closing
+          </label>
+          <button className="underline mt-3" onClick={() => setConfirmClearLibrary(true)}>Clear saved copies</button>
+        </details>
+
         {/* Themes and Settings Foot Panel */}
         <div className="px-5 py-4 border-t flex items-center justify-between" style={{ borderColor: 'var(--border-color)' }}>
           <div className="flex items-center gap-2">
             <div className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: 'var(--accent-success)' }} />
             <span className="text-xs font-medium" role="status" style={{ color: saveStatus === 'error' ? '#dc2626' : 'var(--text-muted)' }}>
-              {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'error' ? 'Save failed' : 'Saved'}
+              {saveStatus === 'saving' ? 'Saving…' : saveStatus === 'error' ? 'Save failed' : !rememberDrafts && !activeFilePath ? 'Session only' : 'Saved'}
             </span>
           </div>
 

@@ -1,22 +1,18 @@
-import DOMPurify from 'dompurify';
 import { parseMarkdown } from './markdownParser';
+import { assertDocumentSize, sanitizeDocumentHtml } from './documentSecurity';
 
 export { resolveMarkdownImagePath } from './filePaths';
 
 export function renderMarkdownPreview(
   content: string,
-  resolveImage?: (source: string) => string,
+  images: Readonly<Record<string, string>> = {},
 ): string {
-  const fragment = DOMPurify.sanitize(parseMarkdown(content), {
-    RETURN_DOM_FRAGMENT: true,
-  });
+  assertDocumentSize(content);
+  return renderParsedPreview(parseMarkdown(content), images, content.length);
+}
 
-  fragment.querySelectorAll('img').forEach((image) => {
-    const source = image.getAttribute('src');
-    if (source && resolveImage) image.setAttribute('src', resolveImage(source));
-    image.setAttribute('loading', 'lazy');
-    image.setAttribute('decoding', 'async');
-  });
+export function renderParsedPreview(html: string, images: Readonly<Record<string, string>> = {}, length = 0): string {
+  const fragment = sanitizeDocumentHtml(html, images);
 
   // Keep the actual table intact, including rowspan/colspan and HTML line breaks.
   fragment.querySelectorAll('table').forEach((table) => {
@@ -30,7 +26,7 @@ export function renderMarkdownPreview(
   });
 
   const container = document.createElement('div');
-  if (content.length > 200_000) {
+  if (length > 200_000) {
     // All content stays searchable, while offscreen sections skip costly layout.
     const nodes = Array.from(fragment.childNodes);
     for (let index = 0; index < nodes.length; index += 80) {
