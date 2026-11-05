@@ -1,5 +1,7 @@
 This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
 
+Security review, remediation status and release requirements are tracked in [SECURITY.md](SECURITY.md).
+
 ## macOS and Windows desktop applications
 
 Mark_md uses the same Next.js/React frontend and Tauri 2 backend on both desktop
@@ -7,7 +9,9 @@ platforms. The app bundles the static `out` directory; end users do not need
 Node.js or a local server. Installers register `.md` and `.markdown` files so
 Finder or Windows Explorer can open documents directly in the viewer.
 
-Build targets are **macOS Apple Silicon** and **Windows 11 x64**. Windows 10,
+Build targets are **macOS Apple Silicon** (macOS 14 or later) and **Windows 11 x64**.
+Older macOS releases no longer receive WebKit security updates, so the app does not
+install there. Windows 10,
 Windows ARM64, Linux, and Intel Mac are not release test targets yet. Windows
 installation and WebView2 checks must pass the [Windows release checklist](docs/windows-testing.md)
 before a build is declared verified. Build configuration alone is not a passed
@@ -32,7 +36,8 @@ npm run desktop:build
 
 The finished app is at `src-tauri/target/release/bundle/macos/Mark_md.app`.
 Move it to `/Applications`, then in Finder use **Open With → Mark_md** on a
-Markdown file. Choose **Change All…** there to make it the default app.
+Markdown file. Choose **Change All…** there to make it the default app. The app
+registers only Markdown (`net.daringfireball.markdown`) files, not plain text in general.
 
 ### Create a Windows installer
 
@@ -66,17 +71,24 @@ for Windows targets; the offline command adds the WebView2 override. The ordinar
 formatting, then builds Windows x64 and macOS Apple Silicon. The WebKit parser
 test also runs on macOS. It runs on pull requests, pushes to `main`, `v*` tags,
 or **Actions → Desktop builds → Run workflow**. Manual runs can select the offline
-Windows installer. Download `Mark_md-windows-x64` or `Mark_md-macos-arm64` from the
-completed run's artifacts. No public release is published automatically.
+Windows installer. Download `Mark_md-windows-x64-unsigned-test` or `Mark_md-macos-arm64-unsigned-test` from the
+completed run's artifacts (marked `unsigned-test`). No public release is published automatically.
+The separate Signed release candidate workflow requires configured signing credentials
+and successful macOS/Windows runtime checks; it verifies signatures before uploading.
+See [signing setup](SECURITY.md#github와-배포).
 
 ### Opening and saving documents
 
 Explorer/Finder opens work both on first launch and when the app is already
-running; the existing window is restored and focused. The desktop **Import**
+running; the existing window is restored and focused. macOS keeps a single
+instance through LaunchServices; the single-instance plugin is used on Windows only. The desktop **Import**
 button opens a native file picker and keeps the original document path. Edits
-are saved to the original file after a short pause. A failed disk write is shown
+are saved to the original file after a short pause. External edits are detected and must be reopened before saving. Writes use
+a temporary file and atomic replacement. A failed disk write is shown
 in the save status and a notification. Wait for **Saved** before closing the app.
 Plain `.txt` imports remain editable copies and never overwrite the source text file.
+Reopening a file that still has unsaved edits (for example after an external change)
+loads the disk version and keeps those edits as a separate `(unsaved edits)` draft.
 
 Exporting a new Markdown document opens the native Save dialog and associates
 the document with that file for subsequent saves. PDF and DOCX exports also use
@@ -85,14 +97,18 @@ The web version retains browser file uploads and downloads.
 
 HTML tables in converted documents retain merged cells (`rowspan`/`colspan`)
 and scroll horizontally within the preview. Large documents skip layout for
-offscreen sections and load images lazily. The library uses IndexedDB and
-automatically migrates older localStorage drafts, avoiding localStorage's small
-size limit.
+offscreen sections and load images lazily. Draft retention is optional: enable **Privacy & local drafts → Keep drafts after closing**
+to store copies in IndexedDB. Fresh installations default to session-only drafts.
+Existing libraries remain available, and **Clear saved copies** removes both current
+and legacy storage without deleting source files. Copies are not encrypted by the app.
+Restored copies carry no filesystem permission; use Import to reopen an original file.
 
 When a document is opened from Finder, Explorer, or the desktop file picker, relative images are resolved from its
 folder, including URL-encoded Korean filenames. Keep the exported `images`
-folder alongside the Markdown file. Asset access is granted only to folders of
-opened documents. Browser imports display the text and tables; browsers cannot
+folder alongside the Markdown file. Only bounded PNG/JPEG/WebP images within that folder or subfolders are allowed.
+Parent traversal, SVG/GIF, embedded data and remote images are blocked. Images are
+read once per document and image list; reopen the document after replacing an image file. The app does
+not grant asset-protocol access to directories. Browser imports display the text and tables; browsers cannot
 access neighboring image files from a single-file upload.
 
 The parser uses anchored matching to avoid a JavaScriptCore regex slowdown on
@@ -100,7 +116,8 @@ large documents. Run `npm test` for parsing regressions and `npm run test:webkit
 on macOS for an output and performance check in JavaScriptCore. You can also
 pass a real document: `npm run test:webkit -- /path/to/document.md`.
 
-Local and CI builds have no distribution signing credentials configured. Windows
+Ordinary local/CI builds are unsigned test builds. The signed-release workflow fails
+closed without configured credentials. Windows
 code signing and Apple Developer signing/notarization must be configured before
 a signed release. Signing does not guarantee that a new Windows build has enough
 SmartScreen reputation to avoid a warning. See [Windows signing](https://v2.tauri.app/distribute/sign/windows/)
@@ -124,7 +141,9 @@ Open [http://localhost:3006](http://localhost:3006) with your browser to see the
 
 You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+The app uses system font fallbacks and makes no Google Fonts requests. Development
+binds to `127.0.0.1`. Webpack bundles the cancellable Markdown parser worker;
+production static HTML receives script-hash CSP metadata during the build.
 
 ## Learn More
 

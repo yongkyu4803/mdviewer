@@ -12,17 +12,18 @@ npm run build    # Production build
 npm run lint     # ESLint
 ```
 
-No test suite is configured.
+Run `npm test`, `npm run lint`, `cargo test --manifest-path src-tauri/Cargo.toml --locked --lib` and the relevant security checks in @SECURITY.md.
+Read @SECURITY.md before changing document rendering, storage, native commands or release configuration.
 
 ## Architecture
 
 **Mark_md** is a single-page Markdown viewer/editor. The entire application is one large client component at `src/app/page.tsx` — no sub-components, no API routes, no server components beyond the root layout.
 
-State is managed with React hooks and persisted to `localStorage`:
+State is managed with React hooks. Optional draft retention uses IndexedDB; localStorage is a compatibility fallback:
 - `markmd_documents` — array of `MarkdownDocument` objects
 - `markmd_theme` — `'dark'` or `'light'`
 
-Markdown rendering uses `marked` synchronously; the HTML is injected via `dangerouslySetInnerHTML` into a `<div class="markdown-preview">`.
+Markdown parsing runs in a cancellable worker with input/output limits. Only the output of `sanitizeDocumentHtml` may enter the preview or PDF DOM. Native file authority is issued by Rust using session IDs; never restore authority from persisted paths. Remote images and raw document CSS are blocked.
 
 ### Theming
 
@@ -30,7 +31,7 @@ Two themes ("Midnight Abyss" dark, "Nordic Frost" light) are driven entirely by 
 
 ### Styling conventions
 
-Tailwind utility classes are used inline. Custom utilities (`.glass`, `.glass-interactive`, `.glow-spot`, `.animate-fade-in`, `.markdown-preview`) are defined in `globals.css`. The editor uses `--font-mono` (Fira Code); body uses `--font-sans` (Inter); both are loaded via Google Fonts in `globals.css` and exposed as CSS variables (not Next.js font variables, which are only used in `layout.tsx`).
+Tailwind utility classes are used inline. Custom utilities (`.glass`, `.glass-interactive`, `.glow-spot`, `.animate-fade-in`, `.markdown-preview`) are defined in `globals.css`. The editor uses `--font-mono` (Fira Code); body uses `--font-sans` (Inter); fonts use system fallbacks without remote font loading and are exposed as CSS variables.
 
 ### View modes
 

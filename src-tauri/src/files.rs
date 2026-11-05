@@ -29,8 +29,8 @@ pub fn resolve_open_path(path: &Path, cwd: &Path) -> Option<PathBuf> {
     if !absolute.is_file() {
         return None;
     }
-    // Avoid Windows verbatim prefixes where a normal Win32 path can be used.
-    dunce::canonicalize(absolute).ok()
+    // Preserve the final component so approval can reject symbolic links.
+    Some(absolute)
 }
 
 #[cfg(test)]
@@ -55,7 +55,7 @@ mod tests {
         std::fs::create_dir_all(folder.join("문서 #1%")).unwrap();
         let file = folder.join("문서 #1%").join("자료.Md");
         std::fs::write(&file, "# test\r\n").unwrap();
-        let expected = dunce::canonicalize(&file).unwrap();
+        let expected = file.clone();
         assert_eq!(
             resolve_open_path(Path::new("문서 #1%/자료.Md"), &folder),
             Some(expected.clone())
