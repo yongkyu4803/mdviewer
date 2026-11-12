@@ -17,7 +17,7 @@
   },
   "dependencies": {
     "@tauri-apps/api": "^2.12.4",
-    "docx": "^9.7.1",
+    "docx": "^9.15.3",
     "dompurify": "^3.4.17",
     "html2canvas": "^1.4.1",
     "jspdf": "^4.2.1",
