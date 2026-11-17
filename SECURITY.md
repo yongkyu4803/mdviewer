@@ -45,6 +45,19 @@
 
 데스크톱 앱의 링크는 wry 기본 동작상 macOS·Windows 모두 새 창 생성이 거부된다. 원격 페이지가 앱 안에서 열리지 않으므로 안전하지만, 링크를 눌러도 동작하지 않는다. 시스템 브라우저로 여는 기능을 추가하더라도 공통 URL 정책을 유지하고 앱 WebView 안에서는 열지 않는다. Windows에서는 문서를 연 동안 그 폴더의 이름 변경·삭제가 막힌다. cap-std가 디렉터리를 삭제 공유 없이 열기 때문이며, 이것이 상위 폴더 교체 방어의 근거다.
 
+## 3차 점검 및 추가 조치 (2026-11-17)
+
+1차·2차 수정은 PR #5로 병합되어 원격 main에 반영됐다. 위 표의 "공개 main 미반영" 항목은 해소됐고, 열린 Dependabot 경고는 아래 예외 표의 glib 1건뿐이다. 재점검에서 높음·중간 등급 결함은 없었다. 정화 결과를 문자열로 직렬화해 다시 파싱하는 미리보기 경로에 mXSS 계열 페이로드 29종을 시험했고 허용 목록 밖 요소·속성은 나오지 않았다(jsdom 기준). 다음 낮음 등급 항목을 조치했다.
+
+| 항목 | 위험 | 조치 | 검증 |
+| --- | --- | --- | --- |
+| FIFO 열기 대기 | 파일을 연 뒤에 일반 파일인지 검사했다. 문서 폴더의 FIFO를 이미지나 문서 이름으로 열면 쓰는 쪽이 생길 때까지 멈춤. 문서 읽기·저장은 세션 잠금을 쥔 채 멈춰 UI까지 정지 | Unix에서 `O_NONBLOCK`으로 열고 일반 파일이 아니면 거절 | Rust 테스트 1개(이미지·승인·읽기·저장·내보내기). 수정 전 동작은 같은 열기 순서의 별도 프로그램으로 재현 |
+| 파일 열기 이벤트의 메인 스레드 I/O | OS 열기 이벤트가 메인 스레드에서 최대 8 MiB를 읽고 해시 | 한 이벤트의 파일들을 blocking pool에서 순서대로 승인. 세션 잠금을 쥔 채 대기열에 넣어 회수된 ID가 남지 않게 하고, 그 뒤 이벤트 발행 | mock 런타임 테스트 1개(순서, 재열기 후 대기열 ID로 읽기) |
+| 읽기 실패 시 권한 잔류 | 승인 직후 읽기가 실패하면 발급된 ID가 앱 종료까지 남음 | 같은 파일을 쓰는 열린 문서가 없으면 ID 회수 | 코드 검토. 자동 테스트 없음 |
+| 빌드 중 서명 자격증명 노출 | `--ignore-scripts`는 설치 훅만 막는다. 프런트엔드 빌드, Cargo 빌드 스크립트, proc-macro가 자격증명이 있는 잡에서 실행됨 | release 환경이 없는 `build` 잡에서 `tauri build --no-bundle`로 컴파일. `signed` 잡은 실행 파일만 받아 `tauri bundle`로 패키징·서명 | macOS에서 프런트엔드 산출물과 빌드 캐시 없이 실행 파일만 두고 `tauri bundle`이 재빌드 없이 `.app`을 만드는 것 확인. actionlint 1.7.12 0건. **워크플로 원격 실행, Windows, 실제 서명은 미검증** |
+
+서명 잡에는 Tauri CLI와 번들러(Windows는 번들러가 내려받는 NSIS 포함)가 남는다. 대소문자만 다른 이름으로 같은 파일을 열면 ID가 둘 발급되지만, 한쪽이 저장하면 다른 쪽은 해시 불일치로 거절된다.
+
 ## 파일·문서 처리 경계
 
 - 파일을 직접 여는 OS 이벤트, Import 및 Save 대화상자만 권한을 만들 수 있다. 프런트엔드나 IndexedDB에 적힌 경로는 권한이 아니다. 재시작 후 저장 사본을 원본에 다시 연결하려면 Import로 직접 열어야 한다.
@@ -93,8 +106,8 @@ Rust 감사의 `vulnerabilities`는 0건이고 다음 경고는 잠금 파일에
 ## 검증 기록
 
 - Vitest: **69개 테스트**. HTML/CSS/XSS, 링크, DOCX 관계 XML, 실제 PDF DOM 삽입 전 정화, 원본 경로 제거, 사본 삭제 순서, 손상/초과 라이브러리 보존, 재개방 시 이전 저장 권한 재사용 차단, 문서 크기, 파서 중단, 기존 파서·경로·PDF 분할·저장 순서, 이미지 캐시, 재열기 시 미저장 편집 보존, raw 내보내기 IPC 테스트.
-- Rust: **16개 테스트**. 정상 승인/읽기/저장/회수, 임의 ID 거절, 링크·상위 폴더 교체, 외부 수정 충돌, 파일 크기, `.txt` 쓰기 거절, 이미지 경계, 선택 전체 검증·용량 계산, 내보내기 파일명·형식 검사. Tauri mock 런타임으로 실제 capability ACL을 거쳐 문서·이미지·저장 명령, raw 내보내기 본문, 원격 출처 거부를 확인.
-- ESLint, TypeScript/production 정적 빌드, macOS `.app` 빌드 통과. GitHub Actions YAML은 actionlint 1.7.12로 검증.
+- Rust: **18개 테스트**. 정상 승인/읽기/저장/회수, FIFO 거절, 열기 이벤트 대기열, 임의 ID 거절, 링크·상위 폴더 교체, 외부 수정 충돌, 파일 크기, `.txt` 쓰기 거절, 이미지 경계, 선택 전체 검증·용량 계산, 내보내기 파일명·형식 검사. Tauri mock 런타임으로 실제 capability ACL을 거쳐 문서·이미지·저장 명령, raw 내보내기 본문, 원격 출처 거부를 확인.
+- ESLint, TypeScript/production 정적 빌드, macOS `.app` 빌드 통과. GitHub Actions YAML은 actionlint 1.7.12로 검증(3차 변경분은 아래 표 참조).
 - JavaScriptCore: 712,000자 출력이 기준 파서와 일치, 확인 실행에서 149 ms.
 - Chromium 실제 UI: 같은 악성 입력의 미리보기·PDF에서 스크립트 실행 0회, 원문 CSS 전역 적용 없음, 외부 추적 이미지 요청 0회. PDF 생성 성공. DOCX 링크 관계는 안전한 https 링크만 포함.
 - Chromium 실제 UI: 새 origin의 기본 보관 꺼짐, 보관 활성화 후 IndexedDB 저장, Clear saved copies 후 IndexedDB 및 legacy localStorage 내용 삭제를 확인.
@@ -114,7 +127,7 @@ Rust 감사의 `vulnerabilities`는 0건이고 다음 경고는 잠금 파일에
 - 기존 Secret scanning·push protection·Actions read 권한은 유지한다.
 - Actions 정책: 전체 SHA 고정 필수. GitHub 소유 Action과 `dtolnay/rust-toolchain`, `Swatinem/rust-cache`만 허용. 새 외부 Action을 쓰려면 이 허용 목록을 먼저 갱신한다.
 
-보안 수정, CI, Dependabot 설정은 작업 브랜치 PR로 게시한다. 필수 검사를 통과한 뒤 병합해야 main에 반영되며, main 직접 푸시는 차단된다. 워크플로 파일 구성과 실제 원격 실행 성공을 혼동하지 않는다.
+1차·2차 수정은 PR #5로 main에 병합됐다. 이후 변경도 작업 브랜치 PR로 게시한다. 필수 검사를 통과한 뒤 병합해야 main에 반영되며, main 직접 푸시는 차단된다. 워크플로 파일 구성과 실제 원격 실행 성공을 혼동하지 않는다.
 
 일반 [desktop.yml](.github/workflows/desktop.yml)은 테스트용 unsigned-test 산출물을 만든다. [signed-release.yml](.github/workflows/signed-release.yml)은 인증서가 없거나 서명/공증 검증이 실패하면 서명 산출물을 업로드하지 않는다. 어느 워크플로도 GitHub Release에 자동 공개하지 않는다.
 

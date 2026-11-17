@@ -37,14 +37,22 @@ jobs:
       - run: cargo test --manifest-path src-tauri/Cargo.toml --locked --lib
       - run: cargo install cargo-audit --version 0.22.2 --locked
       - run: python scripts/audit-rust.py
-  signed:
+  # Compiling runs the frontend build, Cargo build scripts and proc-macros from
+  # every dependency. That happens here, without the release environment, and
+  # only the finished executable is handed to the signing job.
+  build:
     needs: verify
     if: github.ref == 'refs/heads/main' && inputs.runtime_tests_passed
-    environment: release
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        include:
+          - os: macos-latest
+            arguments: ''
+            binary: src-tauri/target/release/app
+          - os: windows-latest
+            arguments: --target x86_64-pc-windows-msvc
+            binary: src-tauri/target/x86_64-pc-windows-msvc/release/Mark_md.exe
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
@@ -55,9 +63,48 @@ jobs:
         with:
           node-version: '22'
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      # No dependency lifecycle scripts run on the signing runner. The build
-      # needs none: only optional core-js and fsevents declare install scripts.
       - run: npm ci --ignore-scripts
+      - run: npx tauri build --no-bundle ${{ matrix.arguments }}
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: Mark_md-unsigned-binary-${{ runner.os }}
+          path: ${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 1
+  # Holds the signing credentials. It compiles nothing: `tauri bundle` packages
+  # and signs the executable built above and does not run beforeBuildCommand.
+  signed:
+    needs: build
+    if: github.ref == 'refs/heads/main' && inputs.runtime_tests_passed
+    environment: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            directory: src-tauri/target/release
+          - os: windows-latest
+            directory: src-tauri/target/x86_64-pc-windows-msvc/release
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+      # The Tauri CLI reads Cargo metadata; it does not build.
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      # No dependency lifecycle scripts run on the signing runner.
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: Mark_md-unsigned-binary-${{ runner.os }}
+          path: ${{ matrix.directory }}
+      # Artifacts do not preserve the executable bit.
+      - if: runner.os == 'macOS'
+        run: chmod +x src-tauri/target/release/app
       - name: Sign and notarize macOS bundle
         if: runner.os == 'macOS'
         env:
@@ -69,7 +116,7 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           node scripts/check-signing-env.mjs macos
-          npm run desktop:build -- --bundles dmg
+          npx tauri bundle --bundles dmg
           codesign --verify --deep --strict src-tauri/target/release/bundle/macos/Mark_md.app
           spctl --assess --type execute src-tauri/target/release/bundle/macos/Mark_md.app
           xcrun stapler validate src-tauri/target/release/bundle/macos/Mark_md.app
@@ -93,8 +140,8 @@ jobs:
             if ($signers.Count -ne 1) { throw 'Exactly one signing private key is required' }
             $certificate = $signers[0]
             @{ bundle = @{ windows = @{ certificateThumbprint = $certificate.Thumbprint; digestAlgorithm = 'sha256'; timestampUrl = $env:WINDOWS_TIMESTAMP_URL; tsp = $true } } } | ConvertTo-Json -Depth 5 | Set-Content $configPath
-            npm run desktop:build:windows -- --config $configPath
-            if ($LASTEXITCODE -ne 0) { throw 'Signed build failed' }
+            npx tauri bundle --target x86_64-pc-windows-msvc --bundles nsis --config $configPath
+            if ($LASTEXITCODE -ne 0) { throw 'Signed bundle failed' }
             $files = @(Get-ChildItem src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe)
             $files += Get-Item src-tauri/target/x86_64-pc-windows-msvc/release/Mark_md.exe
             foreach ($file in $files) {

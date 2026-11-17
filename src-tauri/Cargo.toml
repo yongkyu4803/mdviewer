@@ -39,6 +39,10 @@ tempfile = "3"
 # Mock runtime for IPC/ACL tests; adds no crates to Cargo.lock.
 tauri = { version = "2.11.3", features = ["test"] }
 
+# O_NONBLOCK for opening untrusted names without blocking on a FIFO, and mkfifo in tests.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # macOS relies on LaunchServices; see run() in src/lib.rs.
 [target.'cfg(any(windows, target_os = "linux"))'.dependencies]
 tauri-plugin-single-instance = "2"

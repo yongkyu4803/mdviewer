@@ -278,6 +278,11 @@ export default function Home() {
         if (merged.recovered) showToast(`Unsaved edits to ${title} were kept as a separate draft.`);
       } catch (error) {
         console.error(`Could not open ${path}:`, error);
+        // The native side already issued an ID for this path. Release it unless
+        // a document that is still open keeps saving to the same file.
+        if (!documentsRef.current.some((doc) => doc.desktopFilePath === path)) {
+          await closeMarkdownPath(path).catch(() => undefined);
+        }
         if (unsavedPathsRef.current.has(path)) setFileSaveStates((current) => ({ ...current, [path]: 'error' }));
         showToast(`Could not open ${fileNameFromPath(path)}. ${String(error)}`);
       }

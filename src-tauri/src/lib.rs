@@ -41,23 +41,39 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| e.to_string())?
 }
 
-fn emit_or_queue_file<R: Runtime>(app: &AppHandle<R>, path: PathBuf) {
-    if !is_markdown_path(&path) {
+/// Called from OS open events on the main thread. Approval canonicalizes,
+/// reads and hashes up to 8 MiB per file, so one event's files are approved in
+/// order on the blocking pool. Each reference is queued while the session lock
+/// is still held: a concurrent reopen of the same path cannot leave a revoked
+/// ID in the queue. The frontend is notified after the references are queued.
+fn open_files<R: Runtime>(app: &AppHandle<R>, paths: Vec<PathBuf>) {
+    if paths.is_empty() {
         return;
     }
-    let reference = documents(app).and_then(|mut documents| documents.approve(&path));
-    match reference {
-        Ok(reference) => {
-            if let Ok(mut pending) = app.state::<PendingFiles>().0.lock() {
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut queued = false;
+        for path in paths.iter().filter(|path| is_markdown_path(path)) {
+            let approved = documents(&app).and_then(|mut documents| {
+                let reference = documents.approve(path)?;
+                let state = app.state::<PendingFiles>();
+                let mut pending = state
+                    .0
+                    .lock()
+                    .map_err(|_| "Pending files are unavailable.".to_string())?;
                 pending.retain(|item| item.path != reference.path);
                 pending.push(reference);
+                Ok(())
+            });
+            match approved {
+                Ok(()) => queued = true,
+                Err(error) => log::warn!("Could not open document: {error}"),
             }
+        }
+        if queued {
             let _ = app.emit(OPEN_FILE_EVENT, ());
         }
-        Err(error) => {
-            log::warn!("Could not open document: {error}");
-        }
-    }
+    });
 }
 
 #[tauri::command]
@@ -250,11 +266,12 @@ pub fn run() {
     // a fixed name, which another local account could occupy first.
     #[cfg(any(windows, target_os = "linux"))]
     let builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
-        for argument in args.into_iter().skip(1) {
-            if let Some(path) = resolve_open_path(Path::new(&argument), Path::new(&cwd)) {
-                emit_or_queue_file(app, path);
-            }
-        }
+        let paths = args
+            .iter()
+            .skip(1)
+            .filter_map(|argument| resolve_open_path(Path::new(argument), Path::new(&cwd)))
+            .collect();
+        open_files(app, paths);
         if let Some(window) = app.get_webview_window("main") {
             let _ = window.show();
             let _ = window.unminimize();
@@ -267,11 +284,11 @@ pub fn run() {
             // Windows Explorer passes documents as arguments on the first launch.
             // macOS Finder uses RunEvent::Opened; command-line launches work too.
             let cwd = std::env::current_dir()?;
-            for argument in std::env::args_os().skip(1) {
-                if let Some(path) = resolve_open_path(Path::new(&argument), &cwd) {
-                    emit_or_queue_file(app.handle(), path);
-                }
-            }
+            let paths = std::env::args_os()
+                .skip(1)
+                .filter_map(|argument| resolve_open_path(Path::new(&argument), &cwd))
+                .collect();
+            open_files(app.handle(), paths);
             if cfg!(debug_assertions) {
                 app.handle().plugin(
                     tauri_plugin_log::Builder::default()
@@ -287,13 +304,12 @@ pub fn run() {
         .run(|_app, _event| {
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Opened { urls } = _event {
-                for url in urls {
-                    if let Ok(path) = url.to_file_path() {
-                        if let Some(path) = resolve_open_path(&path, Path::new("/")) {
-                            emit_or_queue_file(_app, path);
-                        }
-                    }
-                }
+                let paths = urls
+                    .iter()
+                    .filter_map(|url| url.to_file_path().ok())
+                    .filter_map(|path| resolve_open_path(&path, Path::new("/")))
+                    .collect();
+                open_files(_app, paths);
             }
         });
 }
@@ -439,6 +455,53 @@ mod ipc_tests {
         )
         .unwrap_err();
         assert!(forged.to_string().contains("permission expired"));
+    }
+
+    #[test]
+    fn opened_files_are_queued_in_order_with_live_ids() {
+        let (app, webview) = app();
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = ["첫째.md", "둘째.md", "skip.txt"]
+            .iter()
+            .map(|name| {
+                let path = dir.path().join(name);
+                std::fs::write(&path, name).unwrap();
+                path
+            })
+            .collect();
+        // Reopening the first file revokes its earlier ID and requeues it once.
+        open_files(app.handle(), paths.clone());
+        open_files(app.handle(), vec![paths[0].clone()]);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let queued = loop {
+            let queued = app.state::<PendingFiles>().0.lock().unwrap().clone();
+            let done = queued.len() == 2
+                && documents(app.handle()).is_ok_and(|documents| {
+                    queued.iter().all(|item| documents.read(&item.id).is_ok())
+                });
+            if done || std::time::Instant::now() > deadline {
+                break queued;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let names: Vec<String> = queued
+            .iter()
+            .map(|item| item.path.rsplit(['/', '\\']).next().unwrap().to_string())
+            .collect();
+        assert_eq!(names, ["둘째.md", "첫째.md"]);
+        for (item, expected) in queued.iter().zip(["둘째.md", "첫째.md"]) {
+            let content = call(
+                &webview,
+                LOCAL,
+                "read_markdown_file",
+                json(serde_json::json!({ "id": item.id })),
+                HeaderMap::new(),
+            )
+            .unwrap()
+            .deserialize::<String>()
+            .unwrap();
+            assert_eq!(content, expected);
+        }
     }
 
     #[test]
