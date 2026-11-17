@@ -45,6 +45,13 @@ fn error(error: impl std::fmt::Display) -> String {
 fn read_bounded(directory: &Dir, name: &Path, limit: usize) -> Result<Vec<u8>, String> {
     let mut options = OpenOptions::new();
     options.read(true).follow(FollowSymlinks::No);
+    // A FIFO planted under an approved name would otherwise block this open
+    // forever, before the regular-file check below can reject it.
+    #[cfg(unix)]
+    {
+        use cap_std::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
     let file = directory.open_with(name, &options).map_err(error)?;
     let metadata = file.metadata().map_err(error)?;
     if !metadata.is_file() || metadata.len() > limit as u64 {
@@ -502,6 +509,34 @@ mod tests {
             std::fs::read_to_string(outside.join("notes.md")).unwrap(),
             "untouched"
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn fifos_are_rejected_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = |name: &str| {
+            let path = dir.path().join(name);
+            let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+            path
+        };
+        let path = dir.path().join("notes.md");
+        std::fs::write(&path, "original").unwrap();
+        let mut docs = Documents::default();
+        let reference = docs.approve(&path).unwrap();
+        fifo("pipe.png");
+        // Without O_NONBLOCK each of these opens would wait for a writer forever.
+        assert!(docs
+            .images(&reference.id, &["pipe.png".into()])
+            .unwrap()
+            .is_empty());
+        assert!(docs.approve(&fifo("pipe.md")).is_err());
+        std::fs::remove_file(&path).unwrap();
+        fifo("notes.md");
+        assert!(docs.read(&reference.id).is_err());
+        assert!(docs.write(&reference.id, "bad").is_err());
+        assert!(save_selected_export(&path, b"bad").is_err());
     }
     #[cfg(unix)]
     #[test]

@@ -80,6 +80,7 @@ dependencies = [
  "cap-tempfile",
  "dunce",
  "image",
+ "libc",
  "log",
  "percent-encoding",
  "serde",
